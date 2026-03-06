@@ -224,6 +224,7 @@ CONSECUTIVE_LOSS_PAUSE_HOURS: int = 4
 MAX_CONSECUTIVE_LOSSES: int = 3
 PDT_MAX_DAY_TRADES: int = 3
 PDT_ROLLING_DAYS: int = 5
+MOMO_EXECUTION_END_HOUR: int = int(os.getenv("MOMO_EXECUTION_END_HOUR", "12"))
 
 
 def get_settings_summary() -> dict[str, Any]:

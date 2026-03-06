@@ -215,11 +215,11 @@ class CryptoEngine(BaseEngine):
             return None
 
         max_dollars = self._reto.get_position_size("crypto") * size_multiplier
-        entry = signal.entry_price
+        entry = round(signal.entry_price, 2)
         sl_pct = 0.015  # 1.5 %
         tp_pct = 0.035  # 3.5 %
-        sl = entry * (1 - sl_pct) if direction == "LONG" else entry * (1 + sl_pct)
-        tp = entry * (1 + tp_pct) if direction == "LONG" else entry * (1 - tp_pct)
+        sl = round(entry * (1 - sl_pct), 2) if direction == "LONG" else round(entry * (1 + sl_pct), 2)
+        tp = round(entry * (1 + tp_pct), 2) if direction == "LONG" else round(entry * (1 - tp_pct), 2)
         qty = round(max_dollars / entry, 6)  # BTC/ETH fractional
 
         # Validate minimum quantity
@@ -254,6 +254,7 @@ class CryptoEngine(BaseEngine):
             bracket = ib.bracketOrder(action, qty, entry, tp, sl)
             for order in bracket:
                 order.tif = 'GTC'
+            entry_order, tp_order, sl_order = bracket
 
             # Validate entry price is reasonable for this symbol before placing
             current_price = await self._get_current_price(signal.ticker)
@@ -268,8 +269,9 @@ class CryptoEngine(BaseEngine):
                     )
                     return None
 
-            for order in bracket:
-                await self._connection.margin.place_order(contract, order)
+            entry_trade = await self._connection.margin.place_order(contract, entry_order)
+            await self._connection.margin.place_order(contract, tp_order)
+            await self._connection.margin.place_order(contract, sl_order)
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Order error: %s", exc)
             return None

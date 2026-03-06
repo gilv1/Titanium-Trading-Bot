@@ -67,8 +67,12 @@ class IBKRConnection:
                     self.account,
                     self.client_id,
                 )
-                # Register disconnect callback for auto-reconnect
-                self._ib.disconnectedEvent += self._on_disconnect
+                # Register disconnect callback — remove first to avoid double-registration
+                try:
+                    self._ib.disconnectedEvent -= self._on_disconnected
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ib.disconnectedEvent += self._on_disconnected
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -86,12 +90,33 @@ class IBKRConnection:
         logger.error("[%s] All %d connection attempts failed.", self.label, settings.RECONNECT_MAX_RETRIES)
         return False
 
-    def _on_disconnect(self) -> None:
+    def _on_disconnected(self) -> None:
         """Called by ib_insync when connection is lost; schedule reconnect."""
         self._connected = False
-        logger.warning("[%s] Disconnected from IBKR. Scheduling reconnect…", self.label)
+        logger.warning("[%s] Disconnected! Scheduling reconnect...", self.label)
         loop = asyncio.get_event_loop()
-        loop.create_task(self.connect())
+        loop.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        """Reconnect with exponential backoff."""
+        for attempt in range(1, settings.RECONNECT_MAX_RETRIES + 1):
+            delay = min(
+                settings.RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                60.0,  # cap at 60 seconds
+            )
+            logger.info(
+                "[%s] Reconnect attempt %d/%d in %.1fs...",
+                self.label,
+                attempt,
+                settings.RECONNECT_MAX_RETRIES,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            success = await self.connect()
+            if success:
+                logger.info("[%s] Reconnected successfully!", self.label)
+                return
+        logger.error("[%s] Failed to reconnect after %d attempts.", self.label, settings.RECONNECT_MAX_RETRIES)
 
     async def disconnect(self) -> None:
         """Gracefully disconnect."""
