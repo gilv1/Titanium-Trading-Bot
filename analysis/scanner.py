@@ -71,8 +71,13 @@ class MomoScanner:
       - Bid/ask spread < $0.02: +5
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ib: object | None = None) -> None:
         self._news_client: object | None = None  # lazy import
+        self._ib = ib  # optional ib_insync IB instance for IBKR scanner
+
+    def set_ib_connection(self, ib: object | None) -> None:
+        """Update the IB connection used for IBKR scanner subscriptions."""
+        self._ib = ib
 
     # ──────────────────────────────────────────────────────────
     # Hard filters
@@ -197,13 +202,42 @@ class MomoScanner:
         """
         Fetch pre-market gap movers from IBKR scanner subscription.
 
-        Falls back to an empty list if IBKR is not available.
+        Uses reqScannerDataAsync when an IB connection is available;
+        falls back to an empty list otherwise.
         """
+        if self._ib is None:
+            logger.debug("[scanner] IBKR scanner not connected; returning empty candidate list.")
+            return []
         candidates: list[MomoCandidate] = []
         try:
-            # Placeholder: in a live environment use ib.reqScannerSubscription
-            # For now return an empty list to avoid hard dependency at import time
-            logger.debug("[scanner] IBKR scanner not connected; returning empty candidate list.")
+            from ib_insync import ScannerSubscription  # type: ignore
+
+            sub = ScannerSubscription(
+                instrument="STK",
+                locationCode="STK.US.MAJOR",
+                scanCode="TOP_PERC_GAIN",
+                abovePrice=2,
+                belowPrice=20,
+                aboveVolume=100_000,
+            )
+            results = await self._ib.reqScannerDataAsync(sub)
+            for item in results:
+                try:
+                    contract = item.contractDetails.contract
+                    ticker = contract.symbol
+                    # distance is the % gain reported by the scanner
+                    gap_pct = float(getattr(item, "distance", 0) or 0)
+                    candidates.append(
+                        MomoCandidate(
+                            ticker=ticker,
+                            gap_pct=gap_pct,
+                            rvol=0.0,        # enriched later via get_rvol()
+                            float_shares=0.0,  # enriched later via get_float()
+                            price=0.0,       # enriched later via market data
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[scanner] Skipping scanner result: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[scanner] IBKR scanner error: %s", exc)
         return candidates
