@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 
 CRYPTO_PAIRS = ("BTC", "ETH")
 
+# Minimum order sizes for IBKR Paxos crypto
+CRYPTO_MIN_QTY = {
+    "BTC": 0.0001,   # ~$6-7 at current prices
+    "ETH": 0.01,     # ~$20 at current prices
+}
+
+CRYPTO_MIN_ORDER_USD = 10.0  # Don't place orders worth less than $10
+
 
 class CryptoEngine(BaseEngine):
     """Motor 4 — BTC/ETH crypto trading engine via IBKR Paxos."""
@@ -94,61 +102,83 @@ class CryptoEngine(BaseEngine):
         ib = self._connection.margin.get_ib()
         if ib is None or not self._connection.margin.is_connected():
             return pd.DataFrame()
-        try:
-            bars = await ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime="",
-                durationStr="1 D",
-                barSizeSetting="1 min",
-                whatToShow="MIDPOINT",
-                useRTH=False,
-            )
-            if not bars:
+
+        for attempt in range(2):  # Retry once on Error 162
+            try:
+                bars = await ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr="1 D",
+                    barSizeSetting="1 min",
+                    whatToShow="MIDPOINT",
+                    useRTH=False,
+                )
+                if not bars:
+                    return pd.DataFrame()
+                return pd.DataFrame(
+                    {
+                        "time": [b.date for b in bars],
+                        "open": [b.open for b in bars],
+                        "high": [b.high for b in bars],
+                        "low": [b.low for b in bars],
+                        "close": [b.close for b in bars],
+                        "volume": [b.volume for b in bars],
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_msg = str(exc)
+                if "different IP address" in error_msg or "162" in error_msg:
+                    if attempt == 0:
+                        logger.warning(
+                            "[crypto] IP conflict on %s data fetch; retrying in 5s...",
+                            getattr(contract, 'symbol', '?'),
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        logger.error(
+                            "[crypto] IP conflict persists for %s; skipping this scan cycle.",
+                            getattr(contract, 'symbol', '?'),
+                        )
+                        return pd.DataFrame()
+                logger.error("[crypto] Error fetching bars for %s: %s", getattr(contract, 'symbol', '?'), exc)
                 return pd.DataFrame()
-            return pd.DataFrame(
-                {
-                    "time": [b.date for b in bars],
-                    "open": [b.open for b in bars],
-                    "high": [b.high for b in bars],
-                    "low": [b.low for b in bars],
-                    "close": [b.close for b in bars],
-                    "volume": [b.volume for b in bars],
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[crypto] Error fetching bars for %s: %s", contract.symbol, exc)
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     async def scan_for_setups(self) -> list[Setup]:
         setups: list[Setup] = []
         session = self._current_session()
 
         for symbol in CRYPTO_PAIRS:
-            contract = self._get_contract(symbol)
-            if contract is None:
+            try:
+                contract = self._get_contract(symbol)
+                if contract is None:
+                    continue
+
+                df = await self._fetch_bars(contract)
+                if df.empty or len(df) < 30:
+                    continue
+
+                vwap = calculate_vwap(df)
+                ema9 = calculate_ema(df, 9)
+                ema21 = calculate_ema(df, 21)
+                atr_series = calculate_atr(df)
+                atr = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
+
+                # VWAP Bounce
+                sig = detect_vwap_bounce(df, vwap)
+                if sig:
+                    sig.ticker = symbol
+                    setups.append(Setup(signal=sig, engine="crypto", session=session, atr=atr))
+
+                # EMA Pullback
+                sig = detect_ema_pullback(df, ema9, ema21)
+                if sig:
+                    sig.ticker = symbol
+                    setups.append(Setup(signal=sig, engine="crypto", session=session, atr=atr))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[crypto] Error scanning %s: %s", symbol, exc)
                 continue
-
-            df = await self._fetch_bars(contract)
-            if df.empty or len(df) < 30:
-                continue
-
-            vwap = calculate_vwap(df)
-            ema9 = calculate_ema(df, 9)
-            ema21 = calculate_ema(df, 21)
-            atr_series = calculate_atr(df)
-            atr = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
-
-            # VWAP Bounce
-            sig = detect_vwap_bounce(df, vwap)
-            if sig:
-                sig.ticker = symbol
-                setups.append(Setup(signal=sig, engine="crypto", session=session, atr=atr))
-
-            # EMA Pullback
-            sig = detect_ema_pullback(df, ema9, ema21)
-            if sig:
-                sig.ticker = symbol
-                setups.append(Setup(signal=sig, engine="crypto", session=session, atr=atr))
 
         return setups
 
@@ -191,6 +221,24 @@ class CryptoEngine(BaseEngine):
         sl = entry * (1 - sl_pct) if direction == "LONG" else entry * (1 + sl_pct)
         tp = entry * (1 + tp_pct) if direction == "LONG" else entry * (1 - tp_pct)
         qty = round(max_dollars / entry, 6)  # BTC/ETH fractional
+
+        # Validate minimum quantity
+        min_qty = CRYPTO_MIN_QTY.get(signal.ticker, 0.001)
+        if qty < min_qty:
+            logger.warning(
+                "[crypto] Calculated qty %.6f for %s is below minimum %.6f (capital=$%.2f). Skipping.",
+                qty, signal.ticker, min_qty, max_dollars,
+            )
+            return None
+
+        # Validate minimum USD value
+        order_value = qty * entry
+        if order_value < CRYPTO_MIN_ORDER_USD:
+            logger.warning(
+                "[crypto] Order value $%.2f for %s is below minimum $%.2f. Skipping.",
+                order_value, signal.ticker, CRYPTO_MIN_ORDER_USD,
+            )
+            return None
 
         contract = self._get_contract(signal.ticker)
         if contract is None:
