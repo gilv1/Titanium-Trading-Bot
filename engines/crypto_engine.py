@@ -19,6 +19,7 @@ import logging
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -49,6 +50,18 @@ CRYPTO_MIN_ORDER_USD = 10.0  # Don't place orders worth less than $10
 
 # Decimal precision for IBKR Paxos crypto quantities (6 decimal places = 0.000001 BTC minimum step)
 CRYPTO_QUANTITY_PRECISION = Decimal('0.000001')
+
+# Tick sizes for IBKR Paxos crypto (Warning 110: price must conform to minimum price variation)
+CRYPTO_TICK_SIZE = {
+    "BTC": 0.25,   # BTC prices must be in $0.25 increments
+    "ETH": 0.01,   # ETH prices in $0.01 increments
+}
+
+
+def _round_to_tick(price: float, symbol: str) -> float:
+    """Round price to the nearest valid tick increment for the given crypto symbol."""
+    tick = CRYPTO_TICK_SIZE.get(symbol, 0.01)
+    return round(round(price / tick) * tick, 2)
 
 
 class CryptoEngine(BaseEngine):
@@ -88,8 +101,6 @@ class CryptoEngine(BaseEngine):
 
     def _current_session(self) -> str:
         """Classify current time into a crypto session."""
-        from zoneinfo import ZoneInfo
-
         now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
         minutes = now.hour * 60 + now.minute
         # Asia: 8 PM – 2 AM ET
@@ -110,6 +121,28 @@ class CryptoEngine(BaseEngine):
         except ImportError:
             return None
         return Crypto(symbol, "PAXOS", "USD")
+
+    def _get_effective_allocation(self) -> float:
+        """Return crypto allocation: 70% off-hours, 30% during market hours.
+
+        During regular market hours (9:30 AM–4:00 PM ET, Mon–Fri), the futures
+        and momo engines are active so crypto uses its standard 30% allocation.
+        Outside those hours capital from idle engines is redirected to crypto (70%).
+        """
+        now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
+        minutes = now.hour * 60 + now.minute
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+        # Weekend: always 70%
+        if weekday >= 5:
+            return 0.70
+
+        # Weekday market hours (9:30 AM–4:00 PM ET): 30%
+        if 570 <= minutes < 960:
+            return 0.30
+
+        # Weekday off-hours: 70%
+        return 0.70
 
     async def _fetch_bars(self, contract: object) -> pd.DataFrame:
         ib = self._connection.margin.get_ib()
@@ -167,6 +200,15 @@ class CryptoEngine(BaseEngine):
                 return []
             self._warmup_complete = True
             logger.info("[crypto] Startup warmup complete — beginning normal scan.")
+
+        # Pre-RTH cutoff: stop opening new crypto trades at 8:30 AM ET on weekdays
+        # to free capital for the RTH open (9:30 AM), which is the most profitable session.
+        _now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
+        _minutes = _now.hour * 60 + _now.minute
+        _weekday = _now.weekday()
+        if _weekday < 5 and 510 <= _minutes < 570:  # 8:30–9:30 AM Mon–Fri
+            logger.info("[crypto] Pre-RTH cutoff: no new trades after 8:30 AM ET.")
+            return []
 
         setups: list[Setup] = []
         session = self._current_session()
@@ -251,13 +293,30 @@ class CryptoEngine(BaseEngine):
             logger.warning("[crypto] Correlation conflict with futures; skipping %s %s.", direction, signal.ticker)
             return None
 
-        max_dollars = self._reto.get_position_size("crypto") * size_multiplier
-        entry = round(signal.entry_price, 2)
+        # Fix 2: dynamic allocation based on time of day
+        allocation = self._get_effective_allocation()
+        max_dollars = self._reto.capital * allocation * size_multiplier
         sl_pct = 0.015  # 1.5 %
         tp_pct = 0.035  # 3.5 %
-        sl = round(entry * (1 - sl_pct), 2) if direction == "LONG" else round(entry * (1 + sl_pct), 2)
-        tp = round(entry * (1 + tp_pct), 2) if direction == "LONG" else round(entry * (1 - tp_pct), 2)
+        # Fix 1: round entry, tp, sl to valid IBKR Paxos tick increments
+        entry = _round_to_tick(signal.entry_price, signal.ticker)
+        sl = (
+            _round_to_tick(entry * (1 - sl_pct), signal.ticker)
+            if direction == "LONG"
+            else _round_to_tick(entry * (1 + sl_pct), signal.ticker)
+        )
+        tp = (
+            _round_to_tick(entry * (1 + tp_pct), signal.ticker)
+            if direction == "LONG"
+            else _round_to_tick(entry * (1 - tp_pct), signal.ticker)
+        )
         qty = round(max_dollars / entry, 6)  # BTC/ETH fractional
+
+        # Fix 6: log the full sizing chain for transparency
+        logger.info(
+            "[crypto] Sizing: capital=$%.2f × alloc=%.0f%% × mult=%.2f = $%.2f → qty=%.6f %s @ $%.2f",
+            self._reto.capital, allocation * 100, size_multiplier, max_dollars, qty, signal.ticker, entry,
+        )
 
         # Validate minimum quantity
         min_qty = CRYPTO_MIN_QTY.get(signal.ticker, 0.001)
@@ -391,11 +450,72 @@ class CryptoEngine(BaseEngine):
         # Conservative fallback: assume stop-loss was hit
         return position.stop_price
 
+    async def _force_close_position(self, ib: Any, position: Position) -> None:
+        """Cancel all open orders for a position and flatten with a market order.
+
+        Used at 9:00 AM ET to free capital before the RTH open.
+        """
+        contract = self._get_contract(position.ticker)
+        if contract is None:
+            return
+        try:
+            # Cancel all open orders for this symbol
+            open_trades = ib.openTrades()
+            for trade in open_trades:
+                if trade.contract.symbol == position.ticker:
+                    try:
+                        ib.cancelOrder(trade.order)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[crypto] Could not cancel order %s for %s: %s",
+                            trade.order.orderId, position.ticker, exc,
+                        )
+
+            await asyncio.sleep(1)  # brief pause for cancels to propagate
+
+            # Place a market order to flatten the position
+            from ib_insync import Order  # type: ignore
+
+            close_action = "SELL" if position.direction == "LONG" else "BUY"
+            qty_decimal = Decimal(str(position.quantity)).quantize(
+                CRYPTO_QUANTITY_PRECISION, rounding=ROUND_DOWN
+            )
+            if qty_decimal <= 0:
+                logger.error("[crypto] Cannot force-close %s: qty rounds to zero.", position.ticker)
+                return
+            market_order = Order(
+                action=close_action,
+                totalQuantity=float(qty_decimal),
+                orderType="MKT",
+                tif="GTC",
+            )
+            await self._connection.margin.place_order(contract, market_order)
+            logger.warning(
+                "[crypto] Market close order placed for %s qty=%.6f.",
+                position.ticker, float(qty_decimal),
+            )
+
+            # Remove the position from tracking immediately (fill will be confirmed via monitor)
+            self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
+            self._risk.close_position("crypto", position.ticker)
+            self._pending_tickers.discard(position.ticker)
+            self._entry_trades.pop(position.ticker, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[crypto] Force-close error for %s: %s", position.ticker, exc)
+
     async def monitor_position(self, position: Position) -> None:
         ib = self._connection.margin.get_ib()
         if ib is None:
             return
         try:
+            # Fix 3: Force-close overnight crypto positions at 9:00 AM ET to free capital for RTH
+            _now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
+            if _now.weekday() < 5 and _now.hour == 9 and _now.minute < 5:
+                logger.warning(
+                    "[crypto] Force-closing %s position before RTH open.", position.ticker
+                )
+                await self._force_close_position(ib, position)
+                return
             # If the entry order was cancelled or rejected, clean up immediately
             entry_trade = self._entry_trades.get(position.ticker)
             if entry_trade is not None:

@@ -7,6 +7,7 @@ on a 0–110 scale. Integrates with Alpha Vantage for news data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -164,13 +165,17 @@ class MomoScanner:
         """
         Run the full pre-market scan.
 
-        Fetches gap movers from IBKR scanner, enriches with Alpha Vantage
-        news data, applies hard filters, scores, and returns sorted list.
+        Fetches gap movers from IBKR scanner, enriches with Yahoo Finance
+        (and Alpha Vantage news data), applies hard filters, scores, and
+        returns sorted list.
         """
         raw_candidates = await self._fetch_gap_movers()
         results: list[MomoCandidate] = []
 
         for candidate in raw_candidates:
+            # Enrich with Yahoo Finance (fills rvol, float, price, etc.)
+            await self._enrich_with_yahoo(candidate)
+
             # Check news catalyst
             has_news = await self.check_news_catalyst(candidate.ticker)
             if has_news:
@@ -197,6 +202,63 @@ class MomoScanner:
     # ──────────────────────────────────────────────────────────
     # Data fetch helpers
     # ──────────────────────────────────────────────────────────
+
+    async def _enrich_with_yahoo(self, candidate: MomoCandidate) -> None:
+        """Enrich candidate data using yfinance as fallback when IBKR/AlphaVantage fail.
+
+        Only updates fields that are still at their zero/empty defaults so that
+        existing IBKR-provided values are never overwritten.
+        """
+        try:
+            import yfinance as yf  # type: ignore
+
+            # yfinance is synchronous — run in a thread to avoid blocking the event loop
+            ticker_obj = await asyncio.to_thread(yf.Ticker, candidate.ticker)
+            info = await asyncio.to_thread(lambda: ticker_obj.info)
+
+            # Price
+            if candidate.price <= 0:
+                candidate.price = float(
+                    info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
+                )
+
+            # Float shares (converted from raw share count to millions)
+            if candidate.float_shares <= 0:
+                float_val = info.get("floatShares", 0) or 0
+                candidate.float_shares = float(float_val) / 1_000_000
+
+            # RVOL (current volume / average volume)
+            if candidate.rvol <= 0:
+                avg_vol = float(info.get("averageVolume", 0) or 0)
+                current_vol = float(
+                    info.get("volume", 0) or info.get("regularMarketVolume", 0) or 0
+                )
+                candidate.rvol = (current_vol / avg_vol) if avg_vol > 0 else 0.0
+
+            # Pre-market volume
+            if candidate.premarket_volume <= 0:
+                candidate.premarket_volume = float(info.get("preMarketVolume", 0) or 0)
+
+            # Short interest as % of float
+            if candidate.short_interest_pct <= 0:
+                short_shares = float(info.get("sharesShort", 0) or 0)
+                float_shares_raw = float(info.get("floatShares", 0) or 1)
+                if float_shares_raw > 0:
+                    candidate.short_interest_pct = (short_shares / float_shares_raw) * 100
+
+            # 52-week high blue-sky check
+            fifty_two_high = float(info.get("fiftyTwoWeekHigh", 0) or 0)
+            if fifty_two_high > 0 and candidate.price > 0 and candidate.price >= fifty_two_high * 0.95:
+                candidate.is_blue_sky = True
+
+            # Bid/ask spread
+            bid = float(info.get("bid", 0) or 0)
+            ask = float(info.get("ask", 0) or 0)
+            if bid > 0 and ask > 0:
+                candidate.bid_ask_spread = ask - bid
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[scanner] Yahoo enrichment failed for %s: %s", candidate.ticker, exc)
 
     async def _fetch_gap_movers(self) -> list[MomoCandidate]:
         """
