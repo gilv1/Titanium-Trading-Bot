@@ -11,11 +11,14 @@ Responsibilities:
   - PDT compliance tracking for momo engine.
   - Per-engine trade-count limits per day.
   - Adaptive profit protection (tier-based score/size restrictions + trailing floor).
+  - Persist kill switch and daily state to disk so restarts don't bypass risk limits.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -30,6 +33,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ENGINES = ("futures", "options", "momo", "crypto")
+
+# Path used to persist kill-switch / daily state across restarts
+_RISK_STATE_PATH = os.path.join("data", "risk_state.json")
 
 
 @dataclass
@@ -100,6 +106,85 @@ class RiskManager:
         self._floor_active: bool = False         # trailing floor has been activated
         self._floor_hit: bool = False            # P&L has dropped to / below floor
 
+        # Load persisted state (kill switch survives restarts)
+        self._load_state()
+
+    # ──────────────────────────────────────────────────────────
+    # State persistence
+    # ──────────────────────────────────────────────────────────
+
+    def _load_state(self) -> None:
+        """Load persisted risk state from disk (kill switch, daily counters)."""
+        try:
+            if not os.path.exists(_RISK_STATE_PATH):
+                return
+            with open(_RISK_STATE_PATH, encoding="utf-8") as fh:
+                state = json.load(fh)
+
+            # Only restore state for the current calendar day
+            saved_date_str = state.get("today_date", "")
+            today_str = date.today().isoformat()
+            if saved_date_str != today_str:
+                logger.info("Risk state file is from a previous day (%s) — ignoring.", saved_date_str)
+                return
+
+            # Kill switch
+            if state.get("kill_switch_active", False):
+                until_str = state.get("kill_switch_until", "")
+                if until_str:
+                    until = datetime.fromisoformat(until_str)
+                    if datetime.utcnow() < until:
+                        self._kill_switch_active = True
+                        self._kill_switch_until = until
+                        logger.warning(
+                            "Kill switch restored from disk — still active until %s.",
+                            until.isoformat(),
+                        )
+                    else:
+                        logger.info("Persisted kill switch found but already expired — ignoring.")
+
+            # Per-engine daily trade counts (as dummy records so the count is preserved)
+            for engine, count in state.get("daily_trades_count", {}).items():
+                for _ in range(int(count)):
+                    self._daily_trades[engine].append(
+                        TradeRecord(engine=engine, pnl=0.0, won=True)
+                    )
+
+            # Consecutive losses
+            for engine, count in state.get("consecutive_losses", {}).items():
+                self._consecutive_losses[engine] = int(count)
+
+            # Engine pauses
+            for engine, until_str in state.get("paused_until", {}).items():
+                if until_str:
+                    until = datetime.fromisoformat(until_str)
+                    if datetime.utcnow() < until:
+                        self._pause_until[engine] = until
+                        logger.info("Engine %s pause restored from disk (until %s).", engine, until_str)
+
+            logger.info("Risk state loaded from %s.", _RISK_STATE_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load risk state from %s: %s", _RISK_STATE_PATH, exc)
+
+    def _save_state(self) -> None:
+        """Persist current risk state to disk so a restart preserves kill switch etc."""
+        try:
+            os.makedirs(os.path.dirname(_RISK_STATE_PATH), exist_ok=True)
+            state = {
+                "kill_switch_active": self._kill_switch_active,
+                "kill_switch_until": self._kill_switch_until.isoformat() if self._kill_switch_until else None,
+                "daily_trades_count": {k: len(v) for k, v in self._daily_trades.items()},
+                "consecutive_losses": dict(self._consecutive_losses),
+                "paused_until": {
+                    k: v.isoformat() for k, v in self._pause_until.items()
+                },
+                "today_date": self._today.isoformat(),
+            }
+            with open(_RISK_STATE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not save risk state to %s: %s", _RISK_STATE_PATH, exc)
+
     # ──────────────────────────────────────────────────────────
     # Daily reset
     # ──────────────────────────────────────────────────────────
@@ -121,6 +206,7 @@ class RiskManager:
             self._last_profit_tier = 0
             self._floor_active = False
             self._floor_hit = False
+            self._save_state()
 
     # ──────────────────────────────────────────────────────────
     # Kill switch
@@ -133,6 +219,7 @@ class RiskManager:
             return False
         if self._kill_switch_until and datetime.utcnow() > self._kill_switch_until:
             self._kill_switch_active = False
+            self._save_state()
             logger.info("Kill switch expired — engines may resume.")
             return False
         return True
@@ -140,6 +227,7 @@ class RiskManager:
     def _activate_kill_switch(self) -> None:
         self._kill_switch_active = True
         self._kill_switch_until = datetime.utcnow() + timedelta(hours=24)
+        self._save_state()
         logger.critical("KILL SWITCH ACTIVATED — all engines halted for 24 h.")
 
     # ──────────────────────────────────────────────────────────
@@ -281,6 +369,9 @@ class RiskManager:
         if engine == "momo":
             self._momo_day_trades.append(date.today())
             self._prune_pdt_window()
+
+        # Persist updated state to disk
+        self._save_state()
 
         # Global kill switch check
         self.check_kill_switch()
@@ -481,9 +572,13 @@ class RiskManager:
             )
 
         # ── Trailing profit floor ──────────────────────────────
-        # Floor activates once P&L crosses tier-1 threshold
+        # Floor activates once P&L crosses EITHER:
+        #   • the tier-1 percentage threshold (PROFIT_TIER_1_PCT % of capital), OR
+        #   • the absolute USD threshold (PROFIT_FLOOR_ACTIVATION_USD)
+        # whichever is reached first (i.e. the lower of the two dollar amounts).
         tier1_threshold = capital * settings.PROFIT_TIER_1_PCT / 100
-        if self._max_daily_pnl_gain >= tier1_threshold:
+        activation_threshold = min(tier1_threshold, settings.PROFIT_FLOOR_ACTIVATION_USD)
+        if self._max_daily_pnl_gain >= activation_threshold:
             floor_value = self._max_daily_pnl_gain * settings.PROFIT_FLOOR_RETENTION_PCT
             event.floor_value = floor_value
 

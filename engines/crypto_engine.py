@@ -25,6 +25,7 @@ import pandas as pd
 from analysis.patterns import detect_ema_pullback, detect_vwap_bounce
 from analysis.technical import calculate_atr, calculate_ema, calculate_vwap
 from config import settings
+from core.reto_tracker import TradeResult as RetoTradeResult
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
 if TYPE_CHECKING:
@@ -72,6 +73,11 @@ class CryptoEngine(BaseEngine):
         # Guard against duplicate bracket orders per ticker within the same loop cycle
         self._pending_tickers: set[str] = set()
         self._entry_trades: dict[str, Any] = {}  # ticker → entry Trade for status checks
+
+        # Startup warmup: skip scanning for the first 120 seconds to allow IBKR
+        # data feeds to stabilise and any existing positions to be detected.
+        self._startup_time: datetime = datetime.utcnow()
+        self._warmup_complete: bool = False
 
     def get_engine_name(self) -> str:
         return "crypto"
@@ -153,6 +159,15 @@ class CryptoEngine(BaseEngine):
         return pd.DataFrame()
 
     async def scan_for_setups(self) -> list[Setup]:
+        # Bug 3: skip scanning during startup warmup (first 120 s)
+        if not self._warmup_complete:
+            elapsed = (datetime.utcnow() - self._startup_time).total_seconds()
+            if elapsed < 120.0:
+                logger.debug("[crypto] Startup warmup in progress (%.0f/120 s) — skipping scan.", elapsed)
+                return []
+            self._warmup_complete = True
+            logger.info("[crypto] Startup warmup complete — beginning normal scan.")
+
         setups: list[Setup] = []
         session = self._current_session()
 
@@ -171,6 +186,16 @@ class CryptoEngine(BaseEngine):
                 ema21 = calculate_ema(df, 21)
                 atr_series = calculate_atr(df)
                 atr = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
+
+                # Bug 4: skip flat markets — ATR < 0.05 % of price
+                last_price = float(df["close"].iloc[-1])
+                if last_price > 0 and atr / last_price < 0.0005:
+                    logger.debug(
+                        "[crypto] %s: ATR too low (%.4f%% of price) — skipping flat market.",
+                        symbol,
+                        (atr / last_price) * 100,
+                    )
+                    continue
 
                 # VWAP Bounce
                 sig = detect_vwap_bounce(df, vwap)
@@ -344,6 +369,28 @@ class CryptoEngine(BaseEngine):
             )
         return None
 
+    def _get_exit_price_from_fills(self, ib: Any, position: Position) -> float:
+        """Look up the actual exit fill price for a closed position from IBKR fills.
+
+        For a LONG position the exit fill is a SELL (side="SLD").
+        For a SHORT position the exit fill is a BUY (side="BOT").
+        Falls back to the position's stop-loss price if no fill is found.
+        """
+        try:
+            fills = ib.fills()
+            exit_side = "SLD" if position.direction == "LONG" else "BOT"
+            matching = [
+                f for f in fills
+                if f.contract.symbol == position.ticker and f.execution.side == exit_side
+            ]
+            if matching:
+                latest = max(matching, key=lambda f: f.execution.time)
+                return float(latest.execution.price)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[crypto] Could not get fill price for %s: %s; using SL fallback.", position.ticker, exc)
+        # Conservative fallback: assume stop-loss was hit
+        return position.stop_price
+
     async def monitor_position(self, position: Position) -> None:
         ib = self._connection.margin.get_ib()
         if ib is None:
@@ -369,9 +416,78 @@ class CryptoEngine(BaseEngine):
             open_trades = ib.openTrades()
             symbol_trades = [t for t in open_trades if t.contract.symbol == position.ticker]
             if not symbol_trades:
+                # Determine exit price from IBKR fills
+                exit_price = self._get_exit_price_from_fills(ib, position)
+
+                # Calculate realised P&L (no multiplier for crypto spot)
+                if position.direction == "LONG":
+                    pnl = (exit_price - position.entry_price) * position.quantity
+                else:
+                    pnl = (position.entry_price - exit_price) * position.quantity
+
+                won = pnl > 0
+
+                # Update capital tracker
+                reto_result = RetoTradeResult(engine="crypto", pnl=pnl)
+                milestones = self._reto.update_capital(reto_result)
+
+                # Build a full TradeResult for the trade journal and Telegram
+                result = TradeResult(
+                    engine="crypto",
+                    ticker=position.ticker,
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    exit_price=exit_price,
+                    stop_loss=position.stop_price,
+                    take_profit=position.target_price,
+                    quantity=position.quantity,
+                    pnl=pnl,
+                    pnl_pct=(
+                        (pnl / (position.entry_price * position.quantity)) * 100
+                        if position.entry_price > 0
+                        else 0.0
+                    ),
+                    duration_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
+                    setup_type="",
+                    session=self._current_session(),
+                    ai_score=0,
+                    phase=self._reto.get_phase(),
+                    capital_after=self._reto.capital,
+                    won=won,
+                )
+                self._trade_history.append(result)
+
+                # Notify risk manager so consecutive-loss counter and daily trade count update
+                self._risk.register_trade(
+                    engine="crypto",
+                    pnl=pnl,
+                    won=won,
+                    direction=position.direction,
+                    ticker=position.ticker,
+                )
+
+                # Clean up position state
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("crypto", position.ticker)
-                self._pending_tickers.discard(position.ticker)  # allow new orders for this ticker
+                self._pending_tickers.discard(position.ticker)
                 self._entry_trades.pop(position.ticker, None)
+
+                logger.info(
+                    "[crypto] Position closed: %s %s P&L=%.2f exit=%.2f",
+                    position.ticker,
+                    "WIN" if won else "LOSS",
+                    pnl,
+                    exit_price,
+                )
+
+                # Telegram exit notification
+                if self._telegram:
+                    asyncio.create_task(self._telegram.send_trade_exit(result))
+
+                # Milestone alerts
+                for msg in milestones:
+                    if self._telegram:
+                        asyncio.create_task(self._telegram.send_milestone_alert(msg))
+
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Monitor error: %s", exc)

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 data/brain_memory.json
+data/risk_state.json
 journal/*.csv
 journal/*.json
 .vscode/

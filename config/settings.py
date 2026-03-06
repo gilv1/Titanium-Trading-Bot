@@ -95,7 +95,7 @@ PHASES: dict[int, PhaseConfig] = {
         options_max_capital=50.0,
         momo_max_capital=100.0,
         sessions=["NY"],
-        max_trades_per_day=6,
+        max_trades_per_day=4,
     ),
     2: PhaseConfig(
         phase=2,
@@ -250,10 +250,15 @@ PROFIT_TIER_1_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_1_SIZE_MULT", "0.7
 PROFIT_TIER_2_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_2_SIZE_MULT", "0.50"))
 PROFIT_TIER_3_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_3_SIZE_MULT", "0.25"))
 
-# Trailing profit floor: once daily P&L exceeds tier-1 threshold,
-# the floor is set to max_pnl × PROFIT_FLOOR_RETENTION_PCT.
+# Trailing profit floor: once daily P&L exceeds tier-1 threshold (or the absolute
+# USD threshold below, whichever is lower), the floor is set to
+# max_pnl × PROFIT_FLOOR_RETENTION_PCT.
 # If current P&L drops below this floor, no new trades are opened.
-PROFIT_FLOOR_RETENTION_PCT: float = float(os.getenv("PROFIT_FLOOR_RETENTION_PCT", "0.60"))
+PROFIT_FLOOR_RETENTION_PCT: float = float(os.getenv("PROFIT_FLOOR_RETENTION_PCT", "0.70"))
+
+# Absolute dollar gain that also activates the profit floor (independent of the
+# percentage tier-1 threshold). Whichever threshold is hit first wins.
+PROFIT_FLOOR_ACTIVATION_USD: float = float(os.getenv("PROFIT_FLOOR_ACTIVATION_USD", "25"))
 
 
 def get_settings_summary() -> dict[str, Any]:

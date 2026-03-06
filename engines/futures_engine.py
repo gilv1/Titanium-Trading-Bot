@@ -34,6 +34,7 @@ from analysis.patterns import (
 )
 from analysis.technical import calculate_atr, calculate_ema, calculate_rsi, calculate_vwap
 from config import settings
+from core.reto_tracker import TradeResult as RetoTradeResult
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
 if TYPE_CHECKING:
@@ -371,6 +372,29 @@ class FuturesEngine(BaseEngine):
     # Monitor
     # ──────────────────────────────────────────────────────────
 
+    def _get_exit_price_from_fills(self, ib: Any, position: Position) -> float:
+        """Look up the actual exit fill price for a closed position from IBKR fills.
+
+        For a LONG position the exit fill is a SELL (side="SLD").
+        For a SHORT position the exit fill is a BUY (side="BOT").
+        Falls back to the position's stop-loss price if no fill is found.
+        """
+        try:
+            fills = ib.fills()
+            # Identify exit fills: opposite side to the entry
+            exit_side = "SLD" if position.direction == "LONG" else "BOT"
+            matching = [
+                f for f in fills
+                if f.contract.symbol == position.ticker and f.execution.side == exit_side
+            ]
+            if matching:
+                latest = max(matching, key=lambda f: f.execution.time)
+                return float(latest.execution.price)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[futures] Could not get fill price for %s: %s; using SL fallback.", position.ticker, exc)
+        # Conservative fallback: assume stop-loss was hit
+        return position.stop_price
+
     async def monitor_position(self, position: Position) -> None:
         """
         Check fill/close status and manage trailing stops.
@@ -405,11 +429,80 @@ class FuturesEngine(BaseEngine):
             # If no open trades for this symbol, position is closed
             symbol_trades = [t for t in open_trades if t.contract.symbol == position.ticker]
             if not symbol_trades:
-                # Position closed — record result
+                # Determine exit price from IBKR fills
+                exit_price = self._get_exit_price_from_fills(ib, position)
+
+                # Calculate realised P&L
+                # MNQ multiplier = 2, NQ multiplier = 20
+                multiplier = 20 if self._reto.get_futures_instrument() == "NQ" else 2
+                if position.direction == "LONG":
+                    pnl = (exit_price - position.entry_price) * position.quantity * multiplier
+                else:
+                    pnl = (position.entry_price - exit_price) * position.quantity * multiplier
+
+                won = pnl > 0
+
+                # Update capital tracker
+                reto_result = RetoTradeResult(engine="futures", pnl=pnl)
+                milestones = self._reto.update_capital(reto_result)
+
+                # Build a full TradeResult for the trade journal and Telegram
+                result = TradeResult(
+                    engine="futures",
+                    ticker=position.ticker,
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    exit_price=exit_price,
+                    stop_loss=position.stop_price,
+                    take_profit=position.target_price,
+                    quantity=position.quantity,
+                    pnl=pnl,
+                    pnl_pct=(
+                        (pnl / (position.entry_price * position.quantity * multiplier)) * 100
+                        if position.entry_price > 0
+                        else 0.0
+                    ),
+                    duration_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
+                    setup_type="",
+                    session=self._current_session(),
+                    ai_score=0,
+                    phase=self._reto.get_phase(),
+                    capital_after=self._reto.capital,
+                    won=won,
+                )
+                self._trade_history.append(result)
+
+                # Notify risk manager so consecutive-loss counter and daily trade count update
+                self._risk.register_trade(
+                    engine="futures",
+                    pnl=pnl,
+                    won=won,
+                    direction=position.direction,
+                    ticker=position.ticker,
+                )
+
+                # Clean up position state
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("futures", position.ticker)
-                self._order_pending = False  # allow new orders for this engine
+                self._order_pending = False
                 self._entry_trade = None
-                logger.info("[futures] Position closed: %s", position.ticker)
+
+                logger.info(
+                    "[futures] Position closed: %s %s P&L=%.2f exit=%.2f",
+                    position.ticker,
+                    "WIN" if won else "LOSS",
+                    pnl,
+                    exit_price,
+                )
+
+                # Telegram exit notification
+                if self._telegram:
+                    asyncio.create_task(self._telegram.send_trade_exit(result))
+
+                # Milestone alerts
+                for msg in milestones:
+                    if self._telegram:
+                        asyncio.create_task(self._telegram.send_milestone_alert(msg))
+
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Monitor error: %s", exc)
