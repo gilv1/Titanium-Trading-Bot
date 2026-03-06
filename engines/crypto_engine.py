@@ -65,6 +65,8 @@ class CryptoEngine(BaseEngine):
             telegram=telegram,
             loop_interval=60.0,
         )
+        # Guard against duplicate bracket orders per ticker within the same loop cycle
+        self._pending_tickers: set[str] = set()
 
     def get_engine_name(self) -> str:
         return "crypto"
@@ -209,6 +211,11 @@ class CryptoEngine(BaseEngine):
         signal = setup.signal
         direction = signal.direction
 
+        # Guard: refuse to place a new order for a ticker that already has one pending
+        if signal.ticker in self._pending_tickers:
+            logger.warning("[crypto] Order already pending for %s — skipping duplicate bracket order.", signal.ticker)
+            return None
+
         # Check correlation guard before placing
         if self._risk.has_correlation_conflict("crypto", direction):
             logger.warning("[crypto] Correlation conflict with futures; skipping %s %s.", direction, signal.ticker)
@@ -269,11 +276,13 @@ class CryptoEngine(BaseEngine):
                     )
                     return None
 
+            self._pending_tickers.add(signal.ticker)  # set before placing to prevent duplicates
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
             await self._connection.margin.place_order(contract, tp_order)
             await self._connection.margin.place_order(contract, sl_order)
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Order error: %s", exc)
+            self._pending_tickers.discard(signal.ticker)  # clear so next cycle can retry
             return None
 
         position = Position(
@@ -316,5 +325,6 @@ class CryptoEngine(BaseEngine):
             if not symbol_trades:
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("crypto", position.ticker)
+                self._pending_tickers.discard(position.ticker)  # allow new orders for this ticker
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Monitor error: %s", exc)

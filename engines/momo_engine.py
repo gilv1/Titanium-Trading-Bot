@@ -79,6 +79,8 @@ class MomoEngine(BaseEngine):
         self._scanner = MomoScanner(ib=ib)
         self._scanner_done_today = False
         self._scanner_results_sent = False
+        # Cached pre-market scan results (populated in run_loop, used in scan_for_setups)
+        self._scanner_candidates: list = []
         # Track which tickers have had their 50 % partial exit placed
         self._partial_exits: set[str] = set()
         # Highest price seen per ticker for trailing stop calculation
@@ -144,6 +146,7 @@ class MomoEngine(BaseEngine):
                 if now.hour == 0 and now.minute < 2:
                     self._scanner_done_today = False
                     self._scanner_results_sent = False
+                    self._scanner_candidates = []
 
                 if not self.is_active_session():
                     await asyncio.sleep(self._loop_interval)
@@ -157,6 +160,7 @@ class MomoEngine(BaseEngine):
                 if self._is_premarket() and not self._scanner_done_today:
                     candidates = await self._scanner.scan_premarket()
                     self._scanner_done_today = True
+                    self._scanner_candidates = candidates  # cache for use during execution window
                     logger.info("[momo] Scanner found %d candidates.", len(candidates))
 
                     # Send Telegram alert at 9:00 AM
@@ -256,7 +260,9 @@ class MomoEngine(BaseEngine):
 
     async def scan_for_setups(self) -> list[Setup]:
         """Return setups for top-scored scanner candidates using intraday analysis."""
-        candidates = await self._scanner.scan_premarket()
+        # Use the cached pre-market scan results — do NOT re-run scan_premarket()
+        # during market hours (that caused wasteful re-scanning every 30 s).
+        candidates = self._scanner_candidates
         setups: list[Setup] = []
 
         for candidate in candidates[:5]:  # top 5 by score

@@ -164,6 +164,48 @@ class BaseEngine(ABC):
                     await asyncio.sleep(self._loop_interval)
                     continue
 
+                # ── Profit protection: update daily P&L and get tier info ──
+                # _reto is required by the constructor but guard defensively
+                if self._reto is not None:
+                    daily_pnl = self._reto.get_daily_pnl()
+                    pnl_event = self._risk.update_daily_pnl(daily_pnl.pnl)
+                else:
+                    from core.risk_manager import ProfitProtectionEvent
+                    daily_pnl = None  # type: ignore[assignment]
+                    pnl_event = ProfitProtectionEvent()
+
+                # Send Telegram alerts for profit protection events (non-blocking)
+                if self._telegram:
+                    if pnl_event.tier_entered is not None:
+                        asyncio.create_task(
+                            self._telegram.send_profit_tier_alert(
+                                tier=pnl_event.tier_entered,
+                                pnl=pnl_event.current_pnl,
+                                min_score=pnl_event.min_score,
+                                size_multiplier=pnl_event.size_multiplier,
+                            )
+                        )
+                    if pnl_event.floor_activated:
+                        asyncio.create_task(
+                            self._telegram.send_profit_floor_alert(
+                                activated=True,
+                                pnl=pnl_event.current_pnl,
+                                floor_value=pnl_event.floor_value,
+                            )
+                        )
+                    if pnl_event.floor_hit:
+                        asyncio.create_task(
+                            self._telegram.send_profit_floor_alert(
+                                activated=False,
+                                pnl=pnl_event.current_pnl,
+                                floor_value=pnl_event.floor_value,
+                            )
+                        )
+
+                # Tier thresholds for this iteration
+                tier_min_score = self._risk.get_min_score_for_tier()
+                tier_size_mult = self._risk.get_size_multiplier_for_tier()
+
                 # Scan for potential setups
                 setups = await self.scan_for_setups()
 
@@ -177,7 +219,7 @@ class BaseEngine(ABC):
                     )
 
                     # Let AI brain evaluate
-                    daily_dd = self._reto.get_daily_pnl().pnl_pct if self._reto.get_daily_pnl().pnl < 0 else 0.0
+                    daily_dd = (daily_pnl.pnl_pct if daily_pnl.pnl < 0 else 0.0) if daily_pnl is not None else 0.0
                     decision = self._brain.evaluate_trade(
                         setup_type=setup.signal.setup_type,
                         engine=self.get_engine_name(),
@@ -201,8 +243,21 @@ class BaseEngine(ABC):
                         )
                         continue
 
+                    # Apply adaptive profit protection: enforce tier's minimum score
+                    if decision.score < tier_min_score:
+                        logger.info(
+                            "[%s] Trade skipped: brain score %d < profit tier min %d.",
+                            self.get_engine_name(),
+                            decision.score,
+                            tier_min_score,
+                        )
+                        continue
+
+                    # Apply tier's size multiplier on top of brain's multiplier
+                    effective_size_mult = decision.size_multiplier * tier_size_mult
+
                     # Execute trade
-                    result = await self.execute_trade(setup, decision.size_multiplier, decision.score)
+                    result = await self.execute_trade(setup, effective_size_mult, decision.score)
                     if result is not None:
                         self._trade_history.append(result)
                         self._risk.register_trade(
@@ -237,6 +292,13 @@ class BaseEngine(ABC):
                 # Monitor existing positions
                 for position in list(self._open_positions):
                     await self.monitor_position(position)
+
+                # Reconcile risk manager position count with engine's internal list
+                # This prevents stale counts if monitor_position couldn't reach IBKR
+                self._risk.sync_open_positions(
+                    self.get_engine_name(),
+                    [p.ticker for p in self._open_positions],
+                )
 
             except asyncio.CancelledError:
                 break

@@ -10,6 +10,7 @@ Responsibilities:
   - Correlation guard (NQ long + BTC long blocked).
   - PDT compliance tracking for momo engine.
   - Per-engine trade-count limits per day.
+  - Adaptive profit protection (tier-based score/size restrictions + trailing floor).
 """
 
 from __future__ import annotations
@@ -18,10 +19,13 @@ import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import DefaultDict
+from typing import TYPE_CHECKING, DefaultDict
 
 from config import settings
 from config.settings import ENGINE_DAILY_RISK_PCT
+
+if TYPE_CHECKING:
+    from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,19 @@ class TradeRecord:
     won: bool = True
     direction: str = "LONG"   # "LONG" or "SHORT"
     ticker: str = ""
+
+
+@dataclass
+class ProfitProtectionEvent:
+    """Events emitted by update_daily_pnl() that the engine should act on."""
+
+    tier_entered: int | None = None   # 1, 2, or 3 when a new tier is first entered
+    floor_activated: bool = False     # trailing floor just became active
+    floor_hit: bool = False           # P&L has dropped to / below the floor
+    current_pnl: float = 0.0
+    floor_value: float = 0.0
+    min_score: int = 65
+    size_multiplier: float = 1.0
 
 
 class RiskManager:
@@ -76,6 +93,13 @@ class RiskManager:
         # PDT tracking: rolling deque of day-trade timestamps for momo
         self._momo_day_trades: deque[date] = deque()
 
+        # ── Adaptive profit protection state ──────────────────
+        self._daily_pnl_gain: float = 0.0       # latest reported positive P&L
+        self._max_daily_pnl_gain: float = 0.0   # peak positive P&L for the day
+        self._last_profit_tier: int = 0          # last tier notified (0–3)
+        self._floor_active: bool = False         # trailing floor has been activated
+        self._floor_hit: bool = False            # P&L has dropped to / below floor
+
     # ──────────────────────────────────────────────────────────
     # Daily reset
     # ──────────────────────────────────────────────────────────
@@ -91,6 +115,12 @@ class RiskManager:
             if self._kill_switch_active and self._kill_switch_until and datetime.utcnow() > self._kill_switch_until:
                 self._kill_switch_active = False
                 self._kill_switch_until = None
+            # Reset profit protection state
+            self._daily_pnl_gain = 0.0
+            self._max_daily_pnl_gain = 0.0
+            self._last_profit_tier = 0
+            self._floor_active = False
+            self._floor_hit = False
 
     # ──────────────────────────────────────────────────────────
     # Kill switch
@@ -198,6 +228,11 @@ class RiskManager:
             logger.warning("[momo] BLOCKED: PDT limit reached.")
             return False
 
+        # 9. Adaptive profit floor — stop opening new trades if floor is hit
+        if self._floor_hit:
+            logger.warning("[%s] BLOCKED: profit floor hit — protecting gains.", engine)
+            return False
+
         return True
 
     # ──────────────────────────────────────────────────────────
@@ -264,6 +299,27 @@ class RiskManager:
         positions = self._open_positions[engine]
         self._open_positions[engine] = [(t, d) for t, d in positions if t != ticker]
 
+    def sync_open_positions(self, engine: str, actual_tickers: list[str]) -> None:
+        """
+        Reconcile the risk manager's open-position list for an engine with
+        the engine's own authoritative list.
+
+        Call this at the end of every monitor cycle so that the risk manager
+        stays in sync even if ``close_position`` was skipped (e.g. due to a
+        temporary IBKR disconnect).
+        """
+        actual_set = set(actual_tickers)
+        old_list = self._open_positions[engine]
+        new_list = [(t, d) for t, d in old_list if t in actual_set]
+        removed = len(old_list) - len(new_list)
+        if removed:
+            logger.info(
+                "[%s] Position sync: removed %d stale position(s) from risk tracker.",
+                engine,
+                removed,
+            )
+        self._open_positions[engine] = new_list
+
     def get_open_position_count(self) -> int:
         return sum(len(v) for v in self._open_positions.values())
 
@@ -321,6 +377,148 @@ class RiskManager:
     def get_pdt_trades_remaining(self) -> int:
         self._prune_pdt_window()
         return max(0, settings.PDT_MAX_DAY_TRADES - len(self._momo_day_trades))
+
+    # ──────────────────────────────────────────────────────────
+    # Adaptive Profit Protection
+    # ──────────────────────────────────────────────────────────
+
+    def _get_capital(self) -> float:
+        """Return today's starting capital for profit-protection percentage calculations."""
+        if self._reto_tracker is not None:
+            try:
+                daily = self._reto_tracker.get_daily_pnl()  # type: ignore[attr-defined]
+                if daily.starting_capital > 0:
+                    return daily.starting_capital
+            except Exception:  # noqa: BLE001
+                pass
+        return settings.INITIAL_CAPITAL
+
+    def get_profit_tier(self) -> int:
+        """
+        Return the current profit protection tier (0–3) based on today's P&L
+        as a percentage of starting capital.
+
+        Tier 0: 0 % – PROFIT_TIER_1_PCT      (normal)
+        Tier 1: PROFIT_TIER_1_PCT – PROFIT_TIER_2_PCT
+        Tier 2: PROFIT_TIER_2_PCT – PROFIT_TIER_3_PCT
+        Tier 3: PROFIT_TIER_3_PCT+            (most selective)
+        """
+        capital = self._get_capital()
+        if capital <= 0:
+            return 0
+        pnl_pct = (self._daily_pnl_gain / capital) * 100
+        if pnl_pct >= settings.PROFIT_TIER_3_PCT:
+            return 3
+        if pnl_pct >= settings.PROFIT_TIER_2_PCT:
+            return 2
+        if pnl_pct >= settings.PROFIT_TIER_1_PCT:
+            return 1
+        return 0
+
+    def get_min_score_for_tier(self) -> int:
+        """Return the minimum brain score required for the current profit tier."""
+        tier = self.get_profit_tier()
+        return [
+            settings.PROFIT_TIER_0_MIN_SCORE,
+            settings.PROFIT_TIER_1_MIN_SCORE,
+            settings.PROFIT_TIER_2_MIN_SCORE,
+            settings.PROFIT_TIER_3_MIN_SCORE,
+        ][tier]
+
+    def get_size_multiplier_for_tier(self) -> float:
+        """Return the position size multiplier for the current profit tier."""
+        tier = self.get_profit_tier()
+        return [
+            settings.PROFIT_TIER_0_SIZE_MULT,
+            settings.PROFIT_TIER_1_SIZE_MULT,
+            settings.PROFIT_TIER_2_SIZE_MULT,
+            settings.PROFIT_TIER_3_SIZE_MULT,
+        ][tier]
+
+    def is_profit_floor_hit(self) -> bool:
+        """Return True if the trailing profit floor has been breached."""
+        return self._floor_hit
+
+    def update_daily_pnl(self, pnl: float) -> ProfitProtectionEvent:
+        """
+        Update today's P&L figure and return a ProfitProtectionEvent describing
+        any state changes (tier entry, floor activation, floor breach).
+
+        Parameters
+        ----------
+        pnl : float
+            Current total daily P&L in dollars (positive = gain, negative = loss).
+        """
+        self._maybe_reset_daily()
+        self._daily_pnl_gain = pnl
+
+        # Track running peak
+        if pnl > self._max_daily_pnl_gain:
+            self._max_daily_pnl_gain = pnl
+
+        event = ProfitProtectionEvent(
+            current_pnl=pnl,
+            min_score=self.get_min_score_for_tier(),
+            size_multiplier=self.get_size_multiplier_for_tier(),
+        )
+
+        capital = self._get_capital()
+
+        # ── Tier change detection ──────────────────────────────
+        new_tier = self.get_profit_tier()
+        if new_tier > self._last_profit_tier:
+            event.tier_entered = new_tier
+            self._last_profit_tier = new_tier
+            logger.info(
+                "[risk] Profit tier %d entered — P&L=+$%.2f (%.1f%% of $%.2f). "
+                "Min score=%d, size mult=%.0f%%.",
+                new_tier,
+                pnl,
+                (pnl / capital * 100) if capital > 0 else 0,
+                capital,
+                event.min_score,
+                event.size_multiplier * 100,
+            )
+
+        # ── Trailing profit floor ──────────────────────────────
+        # Floor activates once P&L crosses tier-1 threshold
+        tier1_threshold = capital * settings.PROFIT_TIER_1_PCT / 100
+        if self._max_daily_pnl_gain >= tier1_threshold:
+            floor_value = self._max_daily_pnl_gain * settings.PROFIT_FLOOR_RETENTION_PCT
+            event.floor_value = floor_value
+
+            if not self._floor_active:
+                self._floor_active = True
+                event.floor_activated = True
+                logger.info(
+                    "[risk] Trailing profit floor activated — peak=+$%.2f, floor=+$%.2f.",
+                    self._max_daily_pnl_gain,
+                    floor_value,
+                )
+
+            # Detect floor breach
+            if pnl <= floor_value:
+                if not self._floor_hit:
+                    self._floor_hit = True
+                    event.floor_hit = True
+                    logger.warning(
+                        "[risk] PROFIT FLOOR HIT — P&L=+$%.2f ≤ floor=+$%.2f. "
+                        "No new trades will be opened.",
+                        pnl,
+                        floor_value,
+                    )
+            else:
+                # P&L recovered above floor — re-enable trading
+                if self._floor_hit:
+                    self._floor_hit = False
+                    logger.info(
+                        "[risk] P&L recovered above floor (+$%.2f > +$%.2f). "
+                        "Trading re-enabled.",
+                        pnl,
+                        floor_value,
+                    )
+
+        return event
 
 
 # ──────────────────────────────────────────────────────────────
