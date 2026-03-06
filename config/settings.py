@@ -226,6 +226,35 @@ PDT_MAX_DAY_TRADES: int = 3
 PDT_ROLLING_DAYS: int = 5
 MOMO_EXECUTION_END_HOUR: int = int(os.getenv("MOMO_EXECUTION_END_HOUR", "12"))
 
+# ──────────────────────────────────────────────────────────────
+# Adaptive Profit Protection
+# ──────────────────────────────────────────────────────────────
+# Profit tier thresholds — expressed as % of starting daily capital
+# Tier 0 (normal): 0 % – PROFIT_TIER_1_PCT
+# Tier 1:          PROFIT_TIER_1_PCT – PROFIT_TIER_2_PCT
+# Tier 2:          PROFIT_TIER_2_PCT – PROFIT_TIER_3_PCT
+# Tier 3:          PROFIT_TIER_3_PCT+
+PROFIT_TIER_1_PCT: float = float(os.getenv("PROFIT_TIER_1_PCT", "10"))
+PROFIT_TIER_2_PCT: float = float(os.getenv("PROFIT_TIER_2_PCT", "20"))
+PROFIT_TIER_3_PCT: float = float(os.getenv("PROFIT_TIER_3_PCT", "30"))
+
+# Minimum brain scores per tier (enforced on top of BRAIN_SCORE_HALF_SIZE)
+PROFIT_TIER_0_MIN_SCORE: int = int(os.getenv("PROFIT_TIER_0_MIN_SCORE", "65"))
+PROFIT_TIER_1_MIN_SCORE: int = int(os.getenv("PROFIT_TIER_1_MIN_SCORE", "75"))
+PROFIT_TIER_2_MIN_SCORE: int = int(os.getenv("PROFIT_TIER_2_MIN_SCORE", "82"))
+PROFIT_TIER_3_MIN_SCORE: int = int(os.getenv("PROFIT_TIER_3_MIN_SCORE", "90"))
+
+# Position size multipliers per tier
+PROFIT_TIER_0_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_0_SIZE_MULT", "1.0"))
+PROFIT_TIER_1_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_1_SIZE_MULT", "0.75"))
+PROFIT_TIER_2_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_2_SIZE_MULT", "0.50"))
+PROFIT_TIER_3_SIZE_MULT: float = float(os.getenv("PROFIT_TIER_3_SIZE_MULT", "0.25"))
+
+# Trailing profit floor: once daily P&L exceeds tier-1 threshold,
+# the floor is set to max_pnl × PROFIT_FLOOR_RETENTION_PCT.
+# If current P&L drops below this floor, no new trades are opened.
+PROFIT_FLOOR_RETENTION_PCT: float = float(os.getenv("PROFIT_FLOOR_RETENTION_PCT", "0.60"))
+
 
 def get_settings_summary() -> dict[str, Any]:
     """Return a summary of all active settings for logging/display."""

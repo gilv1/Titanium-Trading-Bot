@@ -171,6 +171,52 @@ class TelegramNotifier:
         """💰 Capital milestone withdrawal recommendation."""
         await self._send(f"💰 <b>CAPITAL MILESTONE</b>\n{milestone_msg}")
 
+    async def send_profit_tier_alert(
+        self,
+        tier: int,
+        pnl: float,
+        min_score: int,
+        size_multiplier: float,
+    ) -> None:
+        """🛡️ Profit protection tier change alert."""
+        tier_emoji = ["🟢", "🟡", "🟠", "🔴"][min(tier, 3)]
+        pnl_sign = "+" if pnl >= 0 else ""
+        msg = (
+            f"{tier_emoji} <b>PROFIT PROTECTION — TIER {tier}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💰 Daily P&amp;L:  <code>{pnl_sign}{pnl:.2f}</code>\n"
+            f"🧠 Min Score:  <code>{min_score}/100</code>\n"
+            f"📦 Size Mult:  <code>{size_multiplier:.0%}</code>\n"
+            f"⚠️ Only high-conviction trades will be approved."
+        )
+        await self._send(msg)
+
+    async def send_profit_floor_alert(
+        self,
+        activated: bool,
+        pnl: float,
+        floor_value: float,
+    ) -> None:
+        """🛡️ Trailing profit floor alert."""
+        pnl_sign = "+" if pnl >= 0 else ""
+        if activated:
+            msg = (
+                f"🛡️ <b>PROFIT FLOOR ACTIVATED</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"💰 Peak P&amp;L:   <code>{pnl_sign}{pnl:.2f}</code>\n"
+                f"🔒 Floor set at: <code>+{floor_value:.2f}</code>\n"
+                f"📉 If P&amp;L drops to floor → no new trades."
+            )
+        else:
+            msg = (
+                f"🚫 <b>PROFIT FLOOR HIT — TRADING PAUSED</b>\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"💰 Current P&amp;L: <code>{pnl_sign}{pnl:.2f}</code>\n"
+                f"🔒 Floor was:    <code>+{floor_value:.2f}</code>\n"
+                f"⛔ No new trades until tomorrow. Existing SL/TP still active."
+            )
+        await self._send(msg)
+
     async def send_weekly_summary(self, summary: dict[str, Any]) -> None:
         """📈 Weekly performance review."""
         pnl = summary.get("total_pnl", 0)

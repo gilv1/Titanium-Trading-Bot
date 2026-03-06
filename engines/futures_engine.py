@@ -99,6 +99,8 @@ class FuturesEngine(BaseEngine):
         )
         self._orb_range: tuple[float, float] | None = None  # (low, high)
         self._session_open_time: datetime | None = None
+        # Guard against duplicate bracket orders within the same loop cycle
+        self._order_pending: bool = False
 
     def get_engine_name(self) -> str:
         return "futures"
@@ -260,6 +262,11 @@ class FuturesEngine(BaseEngine):
         ai_score: int,
     ) -> TradeResult | None:
         """Place a bracket order for a futures trade."""
+        # Guard: refuse to place a new order while a previous one is still pending
+        if self._order_pending:
+            logger.warning("[futures] Order already pending — skipping duplicate bracket order.")
+            return None
+
         try:
             from ib_insync import LimitOrder, Order, StopOrder  # type: ignore
         except ImportError:
@@ -300,11 +307,13 @@ class FuturesEngine(BaseEngine):
                 order.tif = 'GTC'
             entry_order, tp_order, sl_order = bracket
 
+            self._order_pending = True  # set before placing to prevent duplicates
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
             await self._connection.margin.place_order(contract, tp_order)
             await self._connection.margin.place_order(contract, sl_order)
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Order placement error: %s", exc)
+            self._order_pending = False  # clear flag so next cycle can retry
             return None
 
         position = Position(
@@ -377,6 +386,7 @@ class FuturesEngine(BaseEngine):
                 # Position closed — record result
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("futures", position.ticker)
+                self._order_pending = False  # allow new orders for this engine
                 logger.info("[futures] Position closed: %s", position.ticker)
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Monitor error: %s", exc)
