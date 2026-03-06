@@ -167,7 +167,7 @@ class RetoTracker:
             case "momo":
                 return cfg.momo_max_capital
             case "crypto":
-                # 15 % of capital allocated to crypto
+                # 30 % of capital allocated to crypto (configurable via CRYPTO_ALLOCATION env var)
                 return self._capital * (settings.CRYPTO_ALLOCATION / 100)
             case _:
                 return 0.0
