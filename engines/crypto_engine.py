@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -44,6 +45,9 @@ CRYPTO_MIN_QTY = {
 }
 
 CRYPTO_MIN_ORDER_USD = 10.0  # Don't place orders worth less than $10
+
+# Decimal precision for IBKR Paxos crypto quantities (6 decimal places = 0.000001 BTC minimum step)
+CRYPTO_QUANTITY_PRECISION = Decimal('0.000001')
 
 
 class CryptoEngine(BaseEngine):
@@ -259,10 +263,29 @@ class CryptoEngine(BaseEngine):
             ib = self._connection.margin.get_ib()
             if ib is None:
                 return None
-            bracket = ib.bracketOrder(action, qty, entry, tp, sl)
+
+            # Convert qty to Decimal for IBKR Paxos (required for fractional crypto quantities)
+            qty_decimal = Decimal(str(qty)).quantize(CRYPTO_QUANTITY_PRECISION, rounding=ROUND_DOWN)
+            if qty_decimal <= 0:
+                logger.warning(
+                    "[crypto] Qty rounded to zero for %s after Decimal conversion. Skipping.",
+                    signal.ticker,
+                )
+                return None
+
+            # ib_insync bracketOrder requires a float; convert from Decimal after precision is fixed
+            bracket = ib.bracketOrder(action, float(qty_decimal), entry, tp, sl)
             for order in bracket:
                 order.tif = 'GTC'
             entry_order, tp_order, sl_order = bracket
+
+            # Validate that bracket didn't truncate qty to 0
+            if entry_order.totalQuantity <= 0:
+                logger.error(
+                    "[crypto] Bracket order created with totalQuantity=0 for %s (input qty=%.6f). Skipping.",
+                    signal.ticker, float(qty_decimal),
+                )
+                return None
 
             # Validate entry price is reasonable for this symbol before placing
             current_price = await self._get_current_price(signal.ticker)

@@ -122,9 +122,9 @@ class TestPositionSizing:
         assert tracker.get_position_size("options") == 50.0
 
     def test_crypto_position_proportional(self, tracker):
-        """Crypto allocation should be 15 % of capital."""
+        """Crypto allocation should be 30 % of capital."""
         size = tracker.get_position_size("crypto")
-        assert abs(size - 500.0 * 0.15) < 0.01
+        assert abs(size - 500.0 * 0.30) < 0.01
 
 
 # ──────────────────────────────────────────────────────────────

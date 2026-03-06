@@ -45,9 +45,9 @@ ENABLE_CRYPTO: bool = os.getenv("ENABLE_CRYPTO", "true").lower() == "true"
 # Capital Allocation (percentages, must sum to 100)
 # ──────────────────────────────────────────────────────────────
 FUTURES_ALLOCATION: int = int(os.getenv("FUTURES_ALLOCATION", "45"))
-OPTIONS_ALLOCATION: int = int(os.getenv("OPTIONS_ALLOCATION", "20"))
-MOMO_ALLOCATION: int = int(os.getenv("MOMO_ALLOCATION", "20"))
-CRYPTO_ALLOCATION: int = int(os.getenv("CRYPTO_ALLOCATION", "15"))
+OPTIONS_ALLOCATION: int = int(os.getenv("OPTIONS_ALLOCATION", "0"))
+MOMO_ALLOCATION: int = int(os.getenv("MOMO_ALLOCATION", "25"))
+CRYPTO_ALLOCATION: int = int(os.getenv("CRYPTO_ALLOCATION", "30"))
 
 # ──────────────────────────────────────────────────────────────
 # Risk Settings
