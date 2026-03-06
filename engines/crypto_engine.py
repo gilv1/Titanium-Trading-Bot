@@ -152,6 +152,24 @@ class CryptoEngine(BaseEngine):
 
         return setups
 
+    async def _get_current_price(self, symbol: str) -> float:
+        """Fetch the current market price for a crypto symbol."""
+        contract = self._get_contract(symbol)
+        if contract is None:
+            return 0.0
+        ib = self._connection.margin.get_ib()
+        if ib is None:
+            return 0.0
+        try:
+            ticker = ib.reqMktData(contract, '', False, False)
+            await asyncio.sleep(2)
+            price = float(ticker.last or ticker.close or ticker.midpoint() or 0)
+            ib.cancelMktData(contract)
+            return price
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[crypto] Error fetching current price for %s: %s", symbol, exc)
+            return 0.0
+
     async def execute_trade(
         self,
         setup: Setup,
@@ -186,6 +204,22 @@ class CryptoEngine(BaseEngine):
             if ib is None:
                 return None
             bracket = ib.bracketOrder(action, qty, entry, tp, sl)
+            for order in bracket:
+                order.tif = 'GTC'
+
+            # Validate entry price is reasonable for this symbol before placing
+            current_price = await self._get_current_price(signal.ticker)
+            if current_price > 0:
+                deviation = abs(entry - current_price) / current_price
+                if deviation > 0.05:  # more than 5% deviation from current price
+                    logger.error(
+                        "[crypto] Entry price %.2f deviates >5%% from current price %.2f for %s. Skipping.",
+                        entry,
+                        current_price,
+                        signal.ticker,
+                    )
+                    return None
+
             for order in bracket:
                 await self._connection.margin.place_order(contract, order)
         except Exception as exc:  # noqa: BLE001

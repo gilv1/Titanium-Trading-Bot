@@ -47,13 +47,32 @@ logger = logging.getLogger(__name__)
 
 
 def _get_front_month_expiry() -> str:
-    """Return the nearest quarterly futures expiry code (YYYYMM)."""
+    """Return the nearest quarterly futures expiry code (YYYYMM).
+
+    Rolls to the next quarter when within 7 calendar days of the current
+    quarter's third Friday (standard CME expiry).
+    """
+    import calendar
+
     now = datetime.utcnow()
-    # Quarterly cycle: Mar, Jun, Sep, Dec
     quarters = [3, 6, 9, 12]
-    for q in quarters:
+
+    for i, q in enumerate(quarters):
         if now.month <= q:
-            return f"{now.year}{q:02d}"
+            year = now.year
+            cal = calendar.monthcalendar(year, q)
+            # Third Friday of expiry month
+            fridays = [week[calendar.FRIDAY] for week in cal if week[calendar.FRIDAY] != 0]
+            third_friday = fridays[2] if len(fridays) >= 3 else fridays[-1]
+            expiry_date = datetime(year, q, third_friday)
+
+            # If within 7 days of expiry, roll to next quarter
+            if (expiry_date - now).days <= 7:
+                next_idx = (i + 1) % len(quarters)
+                next_year = year + 1 if next_idx == 0 else year
+                return f"{next_year}{quarters[next_idx]:02d}"
+            return f"{year}{q:02d}"
+
     return f"{now.year + 1}03"
 
 
@@ -277,6 +296,8 @@ class FuturesEngine(BaseEngine):
 
         try:
             bracket = ib.bracketOrder(action, qty, entry, tp, sl)
+            for order in bracket:
+                order.tif = 'GTC'
             entry_order, tp_order, sl_order = bracket
 
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
