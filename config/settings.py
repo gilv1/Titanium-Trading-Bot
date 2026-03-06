@@ -1,0 +1,255 @@
+"""
+Settings for Titanium Warrior v3.
+
+Loads all environment variables from .env and defines trading constants,
+phases, session times, and risk limits.
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# ──────────────────────────────────────────────────────────────
+# IBKR Connection
+# ──────────────────────────────────────────────────────────────
+IBKR_HOST: str = os.getenv("IBKR_HOST", "127.0.0.1")
+IBKR_PORT: int = int(os.getenv("IBKR_PORT", "7497"))
+IBKR_MARGIN_ACCOUNT: str = os.getenv("IBKR_MARGIN_ACCOUNT", "")
+IBKR_CASH_ACCOUNT: str = os.getenv("IBKR_CASH_ACCOUNT", "")
+
+# ──────────────────────────────────────────────────────────────
+# API Keys
+# ──────────────────────────────────────────────────────────────
+ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+
+# ──────────────────────────────────────────────────────────────
+# Telegram
+# ──────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ──────────────────────────────────────────────────────────────
+# Engine Toggles
+# ──────────────────────────────────────────────────────────────
+ENABLE_FUTURES: bool = os.getenv("ENABLE_FUTURES", "true").lower() == "true"
+ENABLE_OPTIONS: bool = os.getenv("ENABLE_OPTIONS", "false").lower() == "true"
+ENABLE_MOMO: bool = os.getenv("ENABLE_MOMO", "false").lower() == "true"
+ENABLE_CRYPTO: bool = os.getenv("ENABLE_CRYPTO", "true").lower() == "true"
+
+# ──────────────────────────────────────────────────────────────
+# Capital Allocation (percentages, must sum to 100)
+# ──────────────────────────────────────────────────────────────
+FUTURES_ALLOCATION: int = int(os.getenv("FUTURES_ALLOCATION", "45"))
+OPTIONS_ALLOCATION: int = int(os.getenv("OPTIONS_ALLOCATION", "20"))
+MOMO_ALLOCATION: int = int(os.getenv("MOMO_ALLOCATION", "20"))
+CRYPTO_ALLOCATION: int = int(os.getenv("CRYPTO_ALLOCATION", "15"))
+
+# ──────────────────────────────────────────────────────────────
+# Risk Settings
+# ──────────────────────────────────────────────────────────────
+MAX_DAILY_RISK_PCT: float = float(os.getenv("MAX_DAILY_RISK_PCT", "8"))
+MAX_SIMULTANEOUS_POSITIONS: int = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
+KILL_SWITCH_PCT: float = float(os.getenv("KILL_SWITCH_PCT", "12"))
+INITIAL_CAPITAL: float = float(os.getenv("INITIAL_CAPITAL", "500"))
+
+# ──────────────────────────────────────────────────────────────
+# Trading Mode
+# ──────────────────────────────────────────────────────────────
+TRADING_MODE: str = os.getenv("TRADING_MODE", "paper")
+
+
+# ──────────────────────────────────────────────────────────────
+# Trading Phases
+# ──────────────────────────────────────────────────────────────
+@dataclass
+class PhaseConfig:
+    """Configuration for a single trading phase."""
+
+    phase: int
+    min_capital: float
+    max_capital: float
+    futures_contracts: int  # number of MNQ/NQ contracts
+    futures_instrument: str  # "MNQ" or "NQ"
+    futures_sl_pts: int
+    futures_tp_pts: int
+    options_max_capital: float
+    momo_max_capital: float
+    sessions: list[str] = field(default_factory=list)
+    max_trades_per_day: int = 6
+
+
+PHASES: dict[int, PhaseConfig] = {
+    1: PhaseConfig(
+        phase=1,
+        min_capital=500.0,
+        max_capital=1500.0,
+        futures_contracts=1,
+        futures_instrument="MNQ",
+        futures_sl_pts=10,
+        futures_tp_pts=20,
+        options_max_capital=50.0,
+        momo_max_capital=100.0,
+        sessions=["NY"],
+        max_trades_per_day=6,
+    ),
+    2: PhaseConfig(
+        phase=2,
+        min_capital=1500.0,
+        max_capital=4500.0,
+        futures_contracts=3,
+        futures_instrument="MNQ",
+        futures_sl_pts=10,
+        futures_tp_pts=20,
+        options_max_capital=100.0,
+        momo_max_capital=250.0,
+        sessions=["London", "NY"],
+        max_trades_per_day=6,
+    ),
+    3: PhaseConfig(
+        phase=3,
+        min_capital=4500.0,
+        max_capital=9000.0,
+        futures_contracts=1,
+        futures_instrument="NQ",
+        futures_sl_pts=12,
+        futures_tp_pts=24,
+        options_max_capital=150.0,
+        momo_max_capital=600.0,
+        sessions=["Tokyo", "London", "NY"],
+        max_trades_per_day=8,
+    ),
+    4: PhaseConfig(
+        phase=4,
+        min_capital=9000.0,
+        max_capital=15000.0,
+        futures_contracts=2,
+        futures_instrument="NQ",
+        futures_sl_pts=12,
+        futures_tp_pts=24,
+        options_max_capital=300.0,
+        momo_max_capital=1200.0,
+        sessions=["Tokyo", "London", "NY"],
+        max_trades_per_day=8,
+    ),
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Session Times (US Eastern Time, ET)
+# ──────────────────────────────────────────────────────────────
+@dataclass
+class SessionTime:
+    """Start and end hour (ET) for a trading session."""
+
+    name: str
+    start_hour: int
+    start_minute: int
+    end_hour: int
+    end_minute: int
+
+
+SESSIONS: dict[str, SessionTime] = {
+    "Tokyo": SessionTime("Tokyo", 20, 0, 2, 0),   # 8:00 PM – 2:00 AM ET
+    "London": SessionTime("London", 3, 0, 8, 0),   # 3:00 AM – 8:00 AM ET
+    "NY": SessionTime("NY", 9, 30, 16, 0),         # 9:30 AM – 4:00 PM ET
+    "PreMarket": SessionTime("PreMarket", 6, 0, 9, 25),  # 6:00 AM – 9:25 AM ET
+    "Options": SessionTime("Options", 9, 30, 16, 15),   # 9:30 AM – 4:15 PM ET
+    "Crypto_Asia": SessionTime("Crypto_Asia", 20, 0, 2, 0),
+    "Crypto_Europe": SessionTime("Crypto_Europe", 3, 0, 8, 0),
+    "Crypto_US": SessionTime("Crypto_US", 9, 30, 16, 0),
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Risk Per Engine (daily % of total capital)
+# ──────────────────────────────────────────────────────────────
+ENGINE_DAILY_RISK_PCT: dict[str, float] = {
+    "futures": 4.0,
+    "options": 2.0,
+    "momo": 2.0,
+    "crypto": 2.0,
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# Capital Milestone Alerts
+# ──────────────────────────────────────────────────────────────
+@dataclass
+class MilestoneAlert:
+    """Capital milestone that triggers a withdrawal recommendation."""
+
+    capital_threshold: float
+    withdraw_amount: float
+    message: str
+
+
+MILESTONE_ALERTS: list[MilestoneAlert] = [
+    MilestoneAlert(
+        capital_threshold=2500.0,
+        withdraw_amount=500.0,
+        message="🎯 Milestone $2,500 reached! Consider withdrawing $500 (original capital).",
+    ),
+    MilestoneAlert(
+        capital_threshold=7500.0,
+        withdraw_amount=2000.0,
+        message="🎯 Milestone $7,500 reached! Consider moving $2,000 to a safe account.",
+    ),
+    MilestoneAlert(
+        capital_threshold=12000.0,
+        withdraw_amount=3000.0,
+        message="🎯 Milestone $12,000 reached! Consider moving $3,000 to a safe account.",
+    ),
+]
+
+
+# ──────────────────────────────────────────────────────────────
+# AI Brain Thresholds
+# ──────────────────────────────────────────────────────────────
+BRAIN_SCORE_FULL_SIZE: int = 75
+BRAIN_SCORE_HALF_SIZE: int = 65
+
+# ──────────────────────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────────────────────
+TIMEZONE: str = "America/New_York"
+BRAIN_MEMORY_FILE: str = "data/brain_memory.json"
+RECONNECT_MAX_RETRIES: int = 5
+RECONNECT_BASE_DELAY: float = 2.0  # seconds (exponential backoff base)
+CONSECUTIVE_LOSS_PAUSE_HOURS: int = 4
+MAX_CONSECUTIVE_LOSSES: int = 3
+PDT_MAX_DAY_TRADES: int = 3
+PDT_ROLLING_DAYS: int = 5
+
+
+def get_settings_summary() -> dict[str, Any]:
+    """Return a summary of all active settings for logging/display."""
+    return {
+        "trading_mode": TRADING_MODE,
+        "ibkr_host": IBKR_HOST,
+        "ibkr_port": IBKR_PORT,
+        "margin_account": IBKR_MARGIN_ACCOUNT or "(not set)",
+        "cash_account": IBKR_CASH_ACCOUNT or "(not set)",
+        "engines": {
+            "futures": ENABLE_FUTURES,
+            "options": ENABLE_OPTIONS,
+            "momo": ENABLE_MOMO,
+            "crypto": ENABLE_CRYPTO,
+        },
+        "allocation": {
+            "futures": FUTURES_ALLOCATION,
+            "options": OPTIONS_ALLOCATION,
+            "momo": MOMO_ALLOCATION,
+            "crypto": CRYPTO_ALLOCATION,
+        },
+        "risk": {
+            "max_daily_pct": MAX_DAILY_RISK_PCT,
+            "kill_switch_pct": KILL_SWITCH_PCT,
+            "max_simultaneous_positions": MAX_SIMULTANEOUS_POSITIONS,
+        },
+        "initial_capital": INITIAL_CAPITAL,
+    }
