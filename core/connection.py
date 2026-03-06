@@ -155,6 +155,7 @@ class IBKRConnection:
             logger.error("[%s] Cannot place order: not connected.", self.label)
             return None
         try:
+            order.account = self.account  # required when multiple accounts share one login
             trade = self._ib.placeOrder(contract, order)
             await asyncio.sleep(0)  # yield to allow IB event loop to process
             logger.info(
