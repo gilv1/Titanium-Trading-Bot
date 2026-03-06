@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -67,6 +67,7 @@ class CryptoEngine(BaseEngine):
         )
         # Guard against duplicate bracket orders per ticker within the same loop cycle
         self._pending_tickers: set[str] = set()
+        self._entry_trades: dict[str, Any] = {}  # ticker → entry Trade for status checks
 
     def get_engine_name(self) -> str:
         return "crypto"
@@ -278,11 +279,16 @@ class CryptoEngine(BaseEngine):
 
             self._pending_tickers.add(signal.ticker)  # set before placing to prevent duplicates
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
+            if entry_trade is None:
+                self._pending_tickers.discard(signal.ticker)
+                return None
+            self._entry_trades[signal.ticker] = entry_trade
             await self._connection.margin.place_order(contract, tp_order)
             await self._connection.margin.place_order(contract, sl_order)
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Order error: %s", exc)
             self._pending_tickers.discard(signal.ticker)  # clear so next cycle can retry
+            self._entry_trades.pop(signal.ticker, None)
             return None
 
         position = Position(
@@ -320,11 +326,29 @@ class CryptoEngine(BaseEngine):
         if ib is None:
             return
         try:
+            # If the entry order was cancelled or rejected, clean up immediately
+            entry_trade = self._entry_trades.get(position.ticker)
+            if entry_trade is not None:
+                order_status = entry_trade.orderStatus
+                entry_status = order_status.status if order_status is not None else ""
+                if entry_status in ("Cancelled", "Inactive"):
+                    self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
+                    self._risk.close_position("crypto", position.ticker)
+                    self._pending_tickers.discard(position.ticker)
+                    self._entry_trades.pop(position.ticker, None)
+                    logger.warning(
+                        "[crypto] Entry order %s for %s — clearing pending flag.",
+                        entry_status.lower(),
+                        position.ticker,
+                    )
+                    return
+
             open_trades = ib.openTrades()
             symbol_trades = [t for t in open_trades if t.contract.symbol == position.ticker]
             if not symbol_trades:
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("crypto", position.ticker)
                 self._pending_tickers.discard(position.ticker)  # allow new orders for this ticker
+                self._entry_trades.pop(position.ticker, None)
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Monitor error: %s", exc)

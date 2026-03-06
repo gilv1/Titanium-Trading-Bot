@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -101,6 +101,7 @@ class FuturesEngine(BaseEngine):
         self._session_open_time: datetime | None = None
         # Guard against duplicate bracket orders within the same loop cycle
         self._order_pending: bool = False
+        self._entry_trade: Any = None  # tracked to detect async cancellations
 
     def get_engine_name(self) -> str:
         return "futures"
@@ -309,11 +310,16 @@ class FuturesEngine(BaseEngine):
 
             self._order_pending = True  # set before placing to prevent duplicates
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
+            if entry_trade is None:
+                self._order_pending = False
+                return None
+            self._entry_trade = entry_trade
             await self._connection.margin.place_order(contract, tp_order)
             await self._connection.margin.place_order(contract, sl_order)
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Order placement error: %s", exc)
             self._order_pending = False  # clear flag so next cycle can retry
+            self._entry_trade = None
             return None
 
         position = Position(
@@ -378,6 +384,22 @@ class FuturesEngine(BaseEngine):
             return
 
         try:
+            # If the entry order was cancelled or rejected, clean up immediately
+            if self._entry_trade is not None:
+                order_status = self._entry_trade.orderStatus
+                entry_status = order_status.status if order_status is not None else ""
+                if entry_status in ("Cancelled", "Inactive"):
+                    self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
+                    self._risk.close_position("futures", position.ticker)
+                    self._order_pending = False
+                    self._entry_trade = None
+                    logger.warning(
+                        "[futures] Entry order %s for %s — clearing pending flag.",
+                        entry_status.lower(),
+                        position.ticker,
+                    )
+                    return
+
             # Check open trades for this position
             open_trades = ib.openTrades()
             # If no open trades for this symbol, position is closed
@@ -387,6 +409,7 @@ class FuturesEngine(BaseEngine):
                 self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
                 self._risk.close_position("futures", position.ticker)
                 self._order_pending = False  # allow new orders for this engine
+                self._entry_trade = None
                 logger.info("[futures] Position closed: %s", position.ticker)
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Monitor error: %s", exc)
