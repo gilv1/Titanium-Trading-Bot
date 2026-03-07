@@ -85,6 +85,7 @@ def build_engines(
     reto: Any,
     risk: Any,
     telegram: Any,
+    journal: Any = None,
 ) -> list[Any]:
     """Instantiate enabled engines and return them as a list."""
     from config import settings
@@ -93,28 +94,28 @@ def build_engines(
 
     if settings.ENABLE_FUTURES:
         from engines.futures_engine import FuturesEngine
-        engines.append(FuturesEngine(connection, brain, reto, risk, telegram))
+        engines.append(FuturesEngine(connection, brain, reto, risk, telegram, journal=journal))
         logger.info("🔵 Futures engine ENABLED")
     else:
         logger.info("🔵 Futures engine disabled")
 
     if settings.ENABLE_OPTIONS:
         from engines.options_engine import OptionsEngine
-        engines.append(OptionsEngine(connection, brain, reto, risk, telegram))
+        engines.append(OptionsEngine(connection, brain, reto, risk, telegram, journal=journal))
         logger.info("🟢 Options engine ENABLED")
     else:
         logger.info("🟢 Options engine disabled")
 
     if settings.ENABLE_MOMO:
         from engines.momo_engine import MomoEngine
-        engines.append(MomoEngine(connection, brain, reto, risk, telegram))
+        engines.append(MomoEngine(connection, brain, reto, risk, telegram, journal=journal))
         logger.info("🟡 MoMo engine ENABLED")
     else:
         logger.info("🟡 MoMo engine disabled")
 
     if settings.ENABLE_CRYPTO:
         from engines.crypto_engine import CryptoEngine
-        engines.append(CryptoEngine(connection, brain, reto, risk, telegram))
+        engines.append(CryptoEngine(connection, brain, reto, risk, telegram, journal=journal))
         logger.info("🟠 Crypto engine ENABLED")
     else:
         logger.info("🟠 Crypto engine disabled")
@@ -179,7 +180,7 @@ async def run_bot(trading_mode: str) -> None:
         logger.warning("Cash account not connected — options/momo engines will be inactive.")
 
     # ── 4. Engines ───────────────────────────────────────────
-    engines = build_engines(connection, brain, reto, risk, telegram)
+    engines = build_engines(connection, brain, reto, risk, telegram, journal=journal)
     if not engines:
         logger.warning("No engines enabled. Check your .env settings.")
         return

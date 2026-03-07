@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -65,6 +65,7 @@ class MomoEngine(BaseEngine):
         reto_tracker: "RetoTracker",
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
+        journal: "Any | None" = None,
     ) -> None:
         super().__init__(
             connection_manager=connection_manager,
@@ -73,6 +74,7 @@ class MomoEngine(BaseEngine):
             risk_manager=risk_manager,
             telegram=telegram,
             loop_interval=30.0,
+            journal=journal,
         )
         # Pass IB connection to scanner so it can use IBKR data
         ib = connection_manager.cash.get_ib() if connection_manager.cash.is_connected() else None
