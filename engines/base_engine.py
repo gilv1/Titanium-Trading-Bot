@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from journal.trade_journal import TradeJournal
     from notifications.telegram import TelegramNotifier
 
+from core.ai_evaluator import AIEvaluator
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,6 +141,7 @@ class BaseEngine(ABC):
         self._running = False
         self._open_positions: list[Position] = []
         self._trade_history: list[TradeResult] = []
+        self._ai_evaluator = AIEvaluator()
 
     # ──────────────────────────────────────────────────────────
     # Lifecycle
@@ -255,6 +258,49 @@ class BaseEngine(ABC):
                             tier_min_score,
                         )
                         continue
+
+                    # AI Evaluator: second layer of intelligence after brain approval
+                    daily_pnl_pct = (
+                        daily_pnl.pnl / max(daily_pnl.starting_capital, 1) * 100
+                        if daily_pnl is not None
+                        else 0.0
+                    )
+                    ai_eval = await self._ai_evaluator.evaluate_trade(
+                        setup_type=setup.signal.setup_type,
+                        engine=self.get_engine_name(),
+                        direction=setup.signal.direction,
+                        entry=setup.signal.entry_price,
+                        stop=setup.signal.stop_price,
+                        target=setup.signal.target_price,
+                        session=setup.session,
+                        atr=setup.atr,
+                        brain_score=decision.score,
+                        brain_reasoning=decision.reasoning,
+                        brain_memory=self._brain.memory.to_dict() if hasattr(self._brain.memory, "to_dict") else {},
+                        daily_pnl=daily_pnl.pnl if daily_pnl is not None else 0.0,
+                        daily_pnl_pct=daily_pnl_pct,
+                        instrument=(
+                            self._reto.get_futures_instrument()
+                            if self.get_engine_name() == "futures"
+                            else setup.signal.ticker
+                        ),
+                        open_positions=self._risk.get_open_position_count(),
+                    )
+                    if not ai_eval.approved:
+                        logger.info(
+                            "[%s] AI evaluator REJECTED trade: %s (source=%s)",
+                            self.get_engine_name(),
+                            ai_eval.reasoning,
+                            ai_eval.source,
+                        )
+                        continue
+                    logger.info(
+                        "[%s] AI evaluator APPROVED: %s (source=%s, %dms)",
+                        self.get_engine_name(),
+                        ai_eval.reasoning,
+                        ai_eval.source,
+                        int(ai_eval.response_time_ms),
+                    )
 
                     # Apply tier's size multiplier on top of brain's multiplier
                     effective_size_mult = decision.size_multiplier * tier_size_mult

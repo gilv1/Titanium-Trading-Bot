@@ -44,7 +44,7 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 ENABLE_FUTURES: bool = os.getenv("ENABLE_FUTURES", "true").lower() == "true"
 ENABLE_OPTIONS: bool = os.getenv("ENABLE_OPTIONS", "false").lower() == "true"
 ENABLE_MOMO: bool = os.getenv("ENABLE_MOMO", "false").lower() == "true"
-ENABLE_CRYPTO: bool = os.getenv("ENABLE_CRYPTO", "true").lower() == "true"
+ENABLE_CRYPTO: bool = os.getenv("ENABLE_CRYPTO", "false").lower() == "true"
 
 # ──────────────────────────────────────────────────────────────
 # Capital Allocation (percentages, must sum to 100)
@@ -91,10 +91,10 @@ class PhaseConfig:
 PHASES: dict[int, PhaseConfig] = {
     1: PhaseConfig(
         phase=1,
-        min_capital=500.0,
-        max_capital=1500.0,
+        min_capital=500.0,      # $500-$2,999 → MES (1 contract)
+        max_capital=3000.0,
         futures_contracts=1,
-        futures_instrument="MNQ",
+        futures_instrument="MES",
         futures_sl_pts=10,
         futures_tp_pts=20,
         options_max_capital=50.0,
@@ -104,10 +104,10 @@ PHASES: dict[int, PhaseConfig] = {
     ),
     2: PhaseConfig(
         phase=2,
-        min_capital=1500.0,
-        max_capital=4500.0,
-        futures_contracts=3,
-        futures_instrument="MNQ",
+        min_capital=3000.0,     # $3,000-$4,999 → MES (2 contracts)
+        max_capital=5000.0,
+        futures_contracts=2,
+        futures_instrument="MES",
         futures_sl_pts=10,
         futures_tp_pts=20,
         options_max_capital=100.0,
@@ -117,12 +117,12 @@ PHASES: dict[int, PhaseConfig] = {
     ),
     3: PhaseConfig(
         phase=3,
-        min_capital=4500.0,
+        min_capital=5000.0,     # $5,000-$9,000 → MNQ (1 contract) AUTO-UPGRADE!
         max_capital=9000.0,
         futures_contracts=1,
-        futures_instrument="NQ",
-        futures_sl_pts=12,
-        futures_tp_pts=24,
+        futures_instrument="MNQ",
+        futures_sl_pts=10,
+        futures_tp_pts=20,
         options_max_capital=150.0,
         momo_max_capital=600.0,
         sessions=["Tokyo", "London", "NY"],
@@ -130,9 +130,9 @@ PHASES: dict[int, PhaseConfig] = {
     ),
     4: PhaseConfig(
         phase=4,
-        min_capital=9000.0,
+        min_capital=9000.0,     # $9,000+ → NQ (1 contract)
         max_capital=15000.0,
-        futures_contracts=2,
+        futures_contracts=1,
         futures_instrument="NQ",
         futures_sl_pts=12,
         futures_tp_pts=24,
@@ -230,6 +230,15 @@ MAX_CONSECUTIVE_LOSSES: int = 3
 PDT_MAX_DAY_TRADES: int = 3
 PDT_ROLLING_DAYS: int = 5
 MOMO_EXECUTION_END_HOUR: int = int(os.getenv("MOMO_EXECUTION_END_HOUR", "12"))
+
+# ──────────────────────────────────────────────────────────────
+# AI Evaluator (Groq + Gemini)
+# ──────────────────────────────────────────────────────────────
+AI_EVALUATOR_ENABLED: bool = os.getenv("AI_EVALUATOR_ENABLED", "true").lower() == "true"
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+AI_EVALUATOR_TIMEOUT: float = float(os.getenv("AI_EVALUATOR_TIMEOUT", "3.0"))  # seconds
 
 # ──────────────────────────────────────────────────────────────
 # Adaptive Profit Protection

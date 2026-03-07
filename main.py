@@ -17,8 +17,10 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 # ──────────────────────────────────────────────────────────────
@@ -128,6 +130,34 @@ def build_engines(
 # ──────────────────────────────────────────────────────────────
 
 _shutdown_event = asyncio.Event()
+
+
+def ensure_data_directories() -> None:
+    """Create data and journal directories if they don't exist."""
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("journal", exist_ok=True)
+    os.makedirs("data/backups", exist_ok=True)
+
+
+def backup_brain_memory() -> None:
+    """Create a timestamped backup of brain memory before starting."""
+    src = "data/brain_memory.json"
+    if os.path.exists(src):
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        dst = f"data/backups/brain_memory_{timestamp}.json"
+        try:
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            logger.warning("Could not backup brain memory: %s", exc)
+            return
+
+        # Keep only last 30 backups
+        backups = sorted(
+            [f for f in os.listdir("data/backups") if f.startswith("brain_memory_")],
+            reverse=True,
+        )
+        for old in backups[30:]:
+            os.remove(f"data/backups/{old}")
 
 
 def _handle_signal(*_: Any) -> None:
@@ -243,6 +273,9 @@ def main() -> None:
         import backtest
         backtest.run()
         return
+
+    ensure_data_directories()
+    backup_brain_memory()
 
     mode = "live" if args.live else "paper"
     logger.info("Starting Titanium Warrior v3 in %s mode…", mode)

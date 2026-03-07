@@ -3,8 +3,12 @@ __pycache__/
 *.pyc
 data/brain_memory.json
 data/risk_state.json
+data/backups/*.json
+!data/.gitkeep
+!data/backups/.gitkeep
 journal/*.csv
 journal/*.json
+!journal/.gitkeep
 .vscode/
 .idea/
 *.log
