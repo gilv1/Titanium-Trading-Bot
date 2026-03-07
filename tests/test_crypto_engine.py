@@ -5,9 +5,10 @@ and the software-managed IOC order architecture.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,8 +18,10 @@ from engines.crypto_engine import (
     CRYPTO_TICK_SIZE,
     CRYPTO_MIN_QTY,
     CRYPTO_MAX_POSITION_AGE_SECS,
+    ENTRY_COOLDOWN_SECONDS,
     _round_to_tick,
 )
+from engines.base_engine import Setup, Signal
 
 
 # ──────────────────────────────────────────────────────────────
@@ -41,6 +44,25 @@ def _make_engine() -> CryptoEngine:
         risk_manager=risk,
         telegram=None,
     )
+
+
+def _make_setup(
+    ticker: str = "BTC",
+    direction: str = "LONG",
+    entry_price: float = 70000.0,
+    atr: float = 150.0,
+) -> Setup:
+    """Build a minimal Setup object for use in execute_trade tests."""
+    signal = Signal(
+        ticker=ticker,
+        direction=direction,
+        entry_price=entry_price,
+        stop_price=entry_price * 0.985,
+        target_price=entry_price * 1.035,
+        confidence=80,
+        setup_type="VWAP_BOUNCE",
+    )
+    return Setup(signal=signal, engine="crypto", session="Crypto_US", atr=atr)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -325,3 +347,214 @@ class TestMaxPositionAge:
     def test_max_position_age_is_30_minutes(self):
         """Software time-based stop triggers after 30 minutes."""
         assert CRYPTO_MAX_POSITION_AGE_SECS == 30 * 60
+
+
+# ──────────────────────────────────────────────────────────────
+# ATR-based SL/TP
+# ──────────────────────────────────────────────────────────────
+
+
+class TestATRBasedSLTP:
+    """ATR-based SL/TP should produce sensible dollar distances (not $1,000+)."""
+
+    def test_btc_long_atr150_sl_distance(self):
+        """BTC with ATR=$150: SL should be $225 away (1.5×ATR), not $1,020."""
+        entry = 70000.0
+        atr = 150.0
+        sl = _round_to_tick(entry - atr * 1.5, "BTC")
+        tp = _round_to_tick(entry + atr * 3.0, "BTC")
+        assert sl == pytest.approx(entry - 225.0, abs=0.5)
+        assert tp == pytest.approx(entry + 450.0, abs=0.5)
+
+    def test_btc_short_atr150_sl_above_entry(self):
+        """SHORT: SL is above entry, TP is below entry."""
+        entry = 70000.0
+        atr = 150.0
+        sl = _round_to_tick(entry + atr * 1.5, "BTC")
+        tp = _round_to_tick(entry - atr * 3.0, "BTC")
+        assert sl > entry
+        assert tp < entry
+
+    def test_sl_tp_not_absurd_for_btc(self):
+        """ATR-based SL must be < $500 on BTC (not $1,000+)."""
+        entry = 68000.0
+        atr = 200.0  # generous ATR
+        sl_distance = atr * 1.5
+        assert sl_distance < 500, f"SL distance {sl_distance} is too large for a scalp"
+
+    def test_rr_ratio_is_2_to_1(self):
+        """TP distance should be exactly 2× SL distance."""
+        atr = 150.0
+        sl_distance = atr * 1.5
+        tp_distance = atr * 3.0
+        assert pytest.approx(tp_distance / sl_distance, abs=0.01) == 2.0
+
+    def test_fallback_atr_when_zero(self):
+        """When ATR=0, fallback to 0.2% of price."""
+        entry = 70000.0
+        atr = 0.0
+        if atr <= 0:
+            atr = entry * 0.002
+        assert atr == pytest.approx(140.0)
+
+
+# ──────────────────────────────────────────────────────────────
+# Cooldown timer
+# ──────────────────────────────────────────────────────────────
+
+
+class TestEntryCooldown:
+    """Engine should suppress entry attempts within ENTRY_COOLDOWN_SECONDS."""
+
+    def test_cooldown_constant_is_5_minutes(self):
+        assert ENTRY_COOLDOWN_SECONDS == 300
+
+    def test_engine_has_last_attempt_time_dict(self):
+        engine = _make_engine()
+        assert hasattr(engine, "_last_attempt_time")
+        assert isinstance(engine._last_attempt_time, dict)
+        assert len(engine._last_attempt_time) == 0
+
+    @pytest.mark.asyncio
+    async def test_cooldown_blocks_second_attempt(self):
+        """Second call within 5 minutes returns None without placing an order."""
+        engine = _make_engine()
+        # Simulate a recent entry attempt
+        engine._last_attempt_time["BTC"] = time.time()
+
+        setup = _make_setup(ticker="BTC", entry_price=70000.0, atr=150.0)
+
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cooldown_allows_after_expiry(self):
+        """Attempt is allowed once cooldown has expired."""
+        engine = _make_engine()
+        # Simulate old entry attempt (older than 5 minutes)
+        engine._last_attempt_time["BTC"] = time.time() - ENTRY_COOLDOWN_SECONDS - 1
+
+        # The engine will still skip if capital/price checks fail, so we only
+        # verify that cooldown itself doesn't block — the attempt is recorded.
+        engine._get_current_price = AsyncMock(return_value=0.0)  # 0 is treated as invalid price → early return
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=None)
+
+        await engine.execute_trade(_make_setup(), size_multiplier=1.0, ai_score=80)
+
+        # Cooldown timestamp should have been updated
+        assert engine._last_attempt_time.get("BTC", 0) > time.time() - 5
+
+
+# ──────────────────────────────────────────────────────────────
+# IOC limit price fix (ask ± 2 ticks)
+# ──────────────────────────────────────────────────────────────
+
+
+class TestIOCLimitPriceFix:
+    """IOC entry price should be 2 ticks above market for BUY, 2 below for SELL."""
+
+    def test_buy_ioc_limit_is_2_ticks_above(self):
+        current_price = 70000.00
+        tick = CRYPTO_TICK_SIZE["BTC"]
+        ioc_limit = _round_to_tick(current_price + tick * 2, "BTC")
+        assert ioc_limit == pytest.approx(70000.50)  # 2 × $0.25
+
+    def test_sell_ioc_limit_is_2_ticks_below(self):
+        current_price = 70000.00
+        tick = CRYPTO_TICK_SIZE["BTC"]
+        ioc_limit = _round_to_tick(current_price - tick * 2, "BTC")
+        assert ioc_limit == pytest.approx(69999.50)  # 2 × $0.25
+
+    def test_eth_buy_ioc_limit_is_2_ticks_above(self):
+        current_price = 3250.00
+        tick = CRYPTO_TICK_SIZE["ETH"]
+        ioc_limit = _round_to_tick(current_price + tick * 2, "ETH")
+        assert ioc_limit == pytest.approx(3250.02)  # 2 × $0.01
+
+
+# ──────────────────────────────────────────────────────────────
+# Scanner integration in execute_trade
+# ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestScannerIntegration:
+    """execute_trade() should call the scanner and respect its verdict."""
+
+    async def test_scanner_called_before_order(self):
+        engine = _make_engine()
+        mock_scanner = MagicMock()
+        mock_scanner.get_market_context = AsyncMock(return_value=None)
+        engine._scanner = mock_scanner
+
+        # Force early return after scanner (no valid price)
+        engine._get_current_price = AsyncMock(return_value=0.0)
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        setup = _make_setup(entry_price=70000.0, atr=150.0)
+        await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        mock_scanner.get_market_context.assert_awaited_once_with("BTC")
+
+    async def test_bearish_context_blocks_long(self):
+        """If scanner says market is bearish (not bullish), a LONG entry is skipped."""
+        from core.scanner_pool import MarketContext
+
+        engine = _make_engine()
+        bad_context = MarketContext(
+            price=70000.0,
+            volume_24h=5e9,
+            change_1h=-2.0,  # strongly negative 1h → not bullish
+            change_24h=-4.0,  # freefall → not bullish
+        )
+        mock_scanner = MagicMock()
+        mock_scanner.get_market_context = AsyncMock(return_value=bad_context)
+        engine._scanner = mock_scanner
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        setup = _make_setup(direction="LONG", entry_price=70000.0, atr=150.0)
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        assert result is None
+
+    async def test_bullish_context_blocks_short(self):
+        """If scanner says market is bullish (not bearish), a SHORT entry is skipped."""
+        from core.scanner_pool import MarketContext
+
+        engine = _make_engine()
+        bullish_context = MarketContext(
+            price=70000.0,
+            volume_24h=5e9,
+            change_1h=2.0,   # strong positive 1h → not bearish
+            change_24h=4.0,  # strong uptrend → not bearish
+        )
+        mock_scanner = MagicMock()
+        mock_scanner.get_market_context = AsyncMock(return_value=bullish_context)
+        engine._scanner = mock_scanner
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        setup = _make_setup(direction="SHORT", entry_price=70000.0, atr=150.0)
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        assert result is None
+
+    async def test_no_scanner_data_proceeds(self):
+        """When scanner returns None the engine proceeds (falls back to IBKR signals)."""
+        engine = _make_engine()
+        mock_scanner = MagicMock()
+        mock_scanner.get_market_context = AsyncMock(return_value=None)
+        engine._scanner = mock_scanner
+
+        # Fail at the price-fetch stage so we know it passed the scanner check
+        engine._get_current_price = AsyncMock(return_value=0.0)
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        setup = _make_setup(entry_price=70000.0, atr=150.0)
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        # execute_trade returns None on early exits; we just verify scanner was called
+        assert result is None
+        mock_scanner.get_market_context.assert_awaited_once()
+

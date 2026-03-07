@@ -27,6 +27,10 @@ IBKR_CASH_ACCOUNT: str = os.getenv("IBKR_CASH_ACCOUNT", "")
 # ──────────────────────────────────────────────────────────────
 ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 
+# External scanner APIs (all free, used by ScannerPool for trade confirmation)
+COINCAP_API_KEY: str = os.getenv("COINCAP_API_KEY", "")
+COINGECKO_API_KEY: str = os.getenv("COINGECKO_API_KEY", "")
+
 # ──────────────────────────────────────────────────────────────
 # Telegram
 # ──────────────────────────────────────────────────────────────
