@@ -5,7 +5,7 @@ and the software-managed IOC order architecture.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -193,7 +193,6 @@ class TestCryptoPosition:
     """CryptoPosition dataclass captures the fields needed for software TP/SL monitoring."""
 
     def test_fields_are_set(self):
-        from datetime import timezone
         now = datetime.now(timezone.utc)
         pos = CryptoPosition(
             symbol="BTC",

@@ -573,7 +573,7 @@ class CryptoEngine(BaseEngine):
             pnl=pnl,
             pnl_pct=(
                 (pnl / (position.entry_price * position.quantity)) * 100
-                if position.entry_price > 0
+                if position.entry_price > 0 and position.quantity > 0
                 else 0.0
             ),
             duration_seconds=duration,
