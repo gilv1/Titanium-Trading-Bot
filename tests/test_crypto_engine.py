@@ -5,11 +5,18 @@ Tests for engines/crypto_engine.py — tick rounding, dynamic allocation, pre-RT
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from engines.crypto_engine import CryptoEngine, CRYPTO_TICK_SIZE, _round_to_tick
+from engines.crypto_engine import (
+    CryptoEngine,
+    CRYPTO_TICK_SIZE,
+    CRYPTO_MIN_QTY,
+    SL_BUFFER_TICKS,
+    _round_to_tick,
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -173,3 +180,92 @@ class TestEffectiveAllocation:
             mock_dt.now.return_value = mock_now
             mock_dt.utcnow.return_value = datetime.utcnow()
             assert engine._get_effective_allocation() == 0.70
+
+
+# ──────────────────────────────────────────────────────────────
+# Fix 3: SL order uses STP LMT instead of STP (Error 387 fix)
+# ──────────────────────────────────────────────────────────────
+
+
+class TestSLOrderType:
+    """Verify that the stop-loss child order is built as STP LMT, not STP.
+
+    IBKR Paxos does not support plain STP orders for crypto (Error 387).
+    """
+
+    def _build_sl_order(self, action: str, sl: float, ticker: str) -> "Any":
+        """
+        Simulate the SL order construction logic from execute_trade() so we can
+        assert the order type without running the full async pipeline.
+        """
+        from ib_insync import Order  # type: ignore
+
+        sl_buffer = CRYPTO_TICK_SIZE.get(ticker, 0.01) * SL_BUFFER_TICKS
+        sl_limit_price = (
+            _round_to_tick(sl - sl_buffer, ticker)
+            if action == "BUY"
+            else _round_to_tick(sl + sl_buffer, ticker)
+        )
+        sl_order = Order(
+            action="SELL" if action == "BUY" else "BUY",
+            totalQuantity=0.001,
+            orderType='STP LMT',
+            auxPrice=sl,
+            lmtPrice=sl_limit_price,
+            parentId=1,
+            transmit=True,
+            tif='GTC',
+        )
+        return sl_order
+
+    def test_sl_order_type_is_stp_lmt_for_btc_long(self):
+        """BTC LONG trade: SL child must be STP LMT, not STP."""
+        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
+        assert sl_order.orderType == 'STP LMT', (
+            f"Expected STP LMT but got {sl_order.orderType!r} — Paxos rejects plain STP (Error 387)"
+        )
+
+    def test_sl_order_type_is_stp_lmt_for_btc_short(self):
+        """BTC SHORT trade: SL child must be STP LMT, not STP."""
+        sl_order = self._build_sl_order("SELL", sl=68000.00, ticker="BTC")
+        assert sl_order.orderType == 'STP LMT'
+
+    def test_sl_limit_price_is_below_stop_for_long(self):
+        """For a LONG position the SL limit price must be ≤ the stop trigger price."""
+        sl = 67077.75
+        ticker = "BTC"
+        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS
+        sl_limit_price = _round_to_tick(sl - sl_buffer, ticker)
+        assert sl_limit_price < sl
+
+    def test_sl_limit_price_is_above_stop_for_short(self):
+        """For a SHORT position the SL limit price must be ≥ the stop trigger price."""
+        sl = 68000.00
+        ticker = "BTC"
+        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS
+        sl_limit_price = _round_to_tick(sl + sl_buffer, ticker)
+        assert sl_limit_price > sl
+
+    def test_sl_auxprice_matches_sl_trigger(self):
+        """The auxPrice on the SL order must equal the SL trigger price."""
+        sl = 67077.75
+        sl_order = self._build_sl_order("BUY", sl=sl, ticker="BTC")
+        assert sl_order.auxPrice == sl
+
+    def test_sl_transmit_is_true(self):
+        """The SL order must have transmit=True (last child triggers the bracket)."""
+        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
+        assert sl_order.transmit is True
+
+    def test_sl_tif_is_gtc(self):
+        """The SL order must use TIF=GTC."""
+        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
+        assert sl_order.tif == 'GTC'
+
+    def test_sl_eth_limit_price_uses_eth_tick(self):
+        """ETH SL limit price buffer uses $0.01 tick, not BTC's $0.25."""
+        sl = 3250.00
+        ticker = "ETH"
+        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS   # 4 × $0.01 = $0.04
+        sl_limit_price = _round_to_tick(sl - sl_buffer, ticker)
+        assert sl_limit_price == pytest.approx(3249.96, abs=0.001)

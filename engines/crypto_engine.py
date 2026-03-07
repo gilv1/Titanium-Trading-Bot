@@ -57,6 +57,9 @@ CRYPTO_TICK_SIZE = {
     "ETH": 0.01,   # ETH prices in $0.01 increments
 }
 
+# Number of ticks used as a buffer below/above the SL stop trigger for the STP LMT limit price
+SL_BUFFER_TICKS = 4
+
 
 def _round_to_tick(price: float, symbol: str) -> float:
     """Round price to the nearest valid tick increment for the given crypto symbol."""
@@ -342,7 +345,7 @@ class CryptoEngine(BaseEngine):
 
         action = "BUY" if direction == "LONG" else "SELL"
         try:
-            from ib_insync import Order  # type: ignore
+            from ib_insync import LimitOrder, Order  # type: ignore
 
             ib = self._connection.margin.get_ib()
             if ib is None:
@@ -357,19 +360,60 @@ class CryptoEngine(BaseEngine):
                 )
                 return None
 
-            # ib_insync bracketOrder requires a float; convert from Decimal after precision is fixed
-            bracket = ib.bracketOrder(action, float(qty_decimal), entry, tp, sl)
-            for order in bracket:
-                order.tif = 'GTC'
-            entry_order, tp_order, sl_order = bracket
-
-            # Validate that bracket didn't truncate qty to 0
-            if entry_order.totalQuantity <= 0:
+            # Validate that qty is not zero
+            if float(qty_decimal) <= 0:
                 logger.error(
                     "[crypto] Bracket order created with totalQuantity=0 for %s (input qty=%.6f). Skipping.",
                     signal.ticker, float(qty_decimal),
                 )
                 return None
+
+            parent_id = ib.client.getReqId()
+            exit_action = "SELL" if action == "BUY" else "BUY"
+
+            # Entry (parent) — LimitOrder, not transmitted until children are set
+            entry_order = LimitOrder(
+                action=action,
+                totalQuantity=float(qty_decimal),
+                lmtPrice=entry,
+                orderId=parent_id,
+                transmit=False,
+                tif='GTC',
+            )
+
+            # Take Profit (child) — LimitOrder
+            tp_order = LimitOrder(
+                action=exit_action,
+                totalQuantity=float(qty_decimal),
+                lmtPrice=tp,
+                parentId=parent_id,
+                transmit=False,
+                tif='GTC',
+            )
+
+            # Stop Loss (child) — STP LMT instead of STP: Paxos does not support plain STP (Error 387)
+            # sl_limit_price is set 4 ticks worse than the stop trigger to ensure fill
+            sl_buffer = CRYPTO_TICK_SIZE.get(signal.ticker, 0.01) * SL_BUFFER_TICKS
+            sl_limit_price = (
+                _round_to_tick(sl - sl_buffer, signal.ticker)
+                if action == "BUY"
+                else _round_to_tick(sl + sl_buffer, signal.ticker)
+            )
+            sl_order = Order(
+                action=exit_action,
+                totalQuantity=float(qty_decimal),
+                orderType='STP LMT',
+                auxPrice=sl,
+                lmtPrice=sl_limit_price,
+                parentId=parent_id,
+                transmit=True,
+                tif='GTC',
+            )
+
+            logger.info(
+                "[crypto] Building manual bracket (STP LMT) for Paxos: entry=%.2f, tp=%.2f, sl=%.2f, sl_lmt=%.2f",
+                entry, tp, sl, sl_limit_price,
+            )
 
             # Validate entry price is reasonable for this symbol before placing
             current_price = await self._get_current_price(signal.ticker)
