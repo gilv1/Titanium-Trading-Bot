@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from core.connection import ConnectionManager
     from core.reto_tracker import RetoTracker
     from core.risk_manager import RiskManager
+    from journal.trade_journal import TradeJournal
     from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,7 @@ class BaseEngine(ABC):
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
         loop_interval: float = 60.0,
+        journal: "TradeJournal | None" = None,
     ) -> None:
         self._connection = connection_manager
         self._brain = brain
@@ -133,6 +135,7 @@ class BaseEngine(ABC):
         self._risk = risk_manager
         self._telegram = telegram
         self._loop_interval = loop_interval
+        self._journal = journal
         self._running = False
         self._open_positions: list[Position] = []
         self._trade_history: list[TradeResult] = []
@@ -260,6 +263,11 @@ class BaseEngine(ABC):
                     result = await self.execute_trade(setup, effective_size_mult, decision.score)
                     if result is not None:
                         self._trade_history.append(result)
+                        if self._journal is not None:
+                            try:
+                                self._journal.log_trade(result)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("[%s] Journal log error: %s", self.get_engine_name(), exc)
                         self._risk.register_trade(
                             engine=self.get_engine_name(),
                             pnl=result.pnl,

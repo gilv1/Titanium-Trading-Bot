@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -48,6 +48,7 @@ class OptionsEngine(BaseEngine):
         reto_tracker: "RetoTracker",
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
+        journal: "Any | None" = None,
     ) -> None:
         super().__init__(
             connection_manager=connection_manager,
@@ -56,6 +57,7 @@ class OptionsEngine(BaseEngine):
             risk_manager=risk_manager,
             telegram=telegram,
             loop_interval=60.0,
+            journal=journal,
         )
 
     def get_engine_name(self) -> str:

@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from core.connection import ConnectionManager
     from core.reto_tracker import RetoTracker
     from core.risk_manager import RiskManager
+    from journal.trade_journal import TradeJournal
     from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -57,14 +59,28 @@ CRYPTO_TICK_SIZE = {
     "ETH": 0.01,   # ETH prices in $0.01 increments
 }
 
-# Number of ticks used as a buffer below/above the SL stop trigger for the STP LMT limit price
-SL_BUFFER_TICKS = 4
+# How long (seconds) to hold a position before closing at market if TP/SL not yet hit
+CRYPTO_MAX_POSITION_AGE_SECS = 30 * 60  # 30 minutes
 
 
 def _round_to_tick(price: float, symbol: str) -> float:
     """Round price to the nearest valid tick increment for the given crypto symbol."""
     tick = CRYPTO_TICK_SIZE.get(symbol, 0.01)
     return round(round(price / tick) * tick, 2)
+
+
+@dataclass
+class CryptoPosition:
+    """Tracks an open software-managed crypto position (TP/SL handled in-process)."""
+
+    symbol: str
+    action: str          # 'BUY' or 'SELL' (entry side)
+    qty: float
+    entry_price: float
+    tp_price: float
+    sl_price: float
+    entry_time: datetime
+    order_id: int
 
 
 class CryptoEngine(BaseEngine):
@@ -77,6 +93,7 @@ class CryptoEngine(BaseEngine):
         reto_tracker: "RetoTracker",
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
+        journal: "TradeJournal | None" = None,
     ) -> None:
         super().__init__(
             connection_manager=connection_manager,
@@ -85,10 +102,12 @@ class CryptoEngine(BaseEngine):
             risk_manager=risk_manager,
             telegram=telegram,
             loop_interval=60.0,
+            journal=journal,
         )
-        # Guard against duplicate bracket orders per ticker within the same loop cycle
+        # Guard against duplicate orders per ticker within the same loop cycle
         self._pending_tickers: set[str] = set()
-        self._entry_trades: dict[str, Any] = {}  # ticker → entry Trade for status checks
+        # Tracks the active software-managed position (TP/SL monitored in-process)
+        self._active_position: CryptoPosition | None = None
 
         # Startup warmup: skip scanning for the first 120 seconds to allow IBKR
         # data feeds to stabilise and any existing positions to be detected.
@@ -286,9 +305,15 @@ class CryptoEngine(BaseEngine):
         signal = setup.signal
         direction = signal.direction
 
-        # Guard: refuse to place a new order for a ticker that already has one pending
+        # Guard: refuse to place a new order while a position is already active
         if signal.ticker in self._pending_tickers:
-            logger.warning("[crypto] Order already pending for %s — skipping duplicate bracket order.", signal.ticker)
+            logger.warning("[crypto] Order already pending for %s — skipping.", signal.ticker)
+            return None
+
+        # One position at a time across all crypto pairs
+        if self._active_position is not None:
+            logger.debug("[crypto] Active position in %s — skipping new entry for %s.",
+                         self._active_position.symbol, signal.ticker)
             return None
 
         # Check correlation guard before placing
@@ -296,12 +321,12 @@ class CryptoEngine(BaseEngine):
             logger.warning("[crypto] Correlation conflict with futures; skipping %s %s.", direction, signal.ticker)
             return None
 
-        # Fix 2: dynamic allocation based on time of day
+        # Dynamic allocation based on time of day
         allocation = self._get_effective_allocation()
         max_dollars = self._reto.capital * allocation * size_multiplier
         sl_pct = 0.015  # 1.5 %
         tp_pct = 0.035  # 3.5 %
-        # Fix 1: round entry, tp, sl to valid IBKR Paxos tick increments
+        # Round entry, tp, sl to valid IBKR Paxos tick increments
         entry = _round_to_tick(signal.entry_price, signal.ticker)
         sl = (
             _round_to_tick(entry * (1 - sl_pct), signal.ticker)
@@ -315,7 +340,6 @@ class CryptoEngine(BaseEngine):
         )
         qty = round(max_dollars / entry, 6)  # BTC/ETH fractional
 
-        # Fix 6: log the full sizing chain for transparency
         logger.info(
             "[crypto] Sizing: capital=$%.2f × alloc=%.0f%% × mult=%.2f = $%.2f → qty=%.6f %s @ $%.2f",
             self._reto.capital, allocation * 100, size_multiplier, max_dollars, qty, signal.ticker, entry,
@@ -345,7 +369,7 @@ class CryptoEngine(BaseEngine):
 
         action = "BUY" if direction == "LONG" else "SELL"
         try:
-            from ib_insync import LimitOrder, Order  # type: ignore
+            from ib_insync import LimitOrder  # type: ignore
 
             ib = self._connection.margin.get_ib()
             if ib is None:
@@ -360,99 +384,98 @@ class CryptoEngine(BaseEngine):
                 )
                 return None
 
-            # Validate that qty is not zero
-            if float(qty_decimal) <= 0:
+            # Use the current market price as IOC limit to maximise fill probability.
+            # IOC (Immediate-or-Cancel) is the ONLY supported TIF for Market/Limit orders
+            # on IBKR Paxos — bracket/stop orders are NOT supported (Error 387).
+            current_price = await self._get_current_price(signal.ticker)
+            if current_price <= 0:
+                logger.warning("[crypto] Could not fetch current price for %s — skipping IOC entry.", signal.ticker)
+                return None
+
+            # Reject if signal price is stale (>5% from current market)
+            deviation = abs(entry - current_price) / current_price
+            if deviation > 0.05:
                 logger.error(
-                    "[crypto] Bracket order created with totalQuantity=0 for %s (input qty=%.6f). Skipping.",
-                    signal.ticker, float(qty_decimal),
+                    "[crypto] Entry price %.2f deviates >5%% from current price %.2f for %s. Skipping.",
+                    entry, current_price, signal.ticker,
                 )
                 return None
 
-            parent_id = ib.client.getReqId()
-            exit_action = "SELL" if action == "BUY" else "BUY"
+            # Price the IOC limit at current market to ensure immediate fill
+            ioc_limit = _round_to_tick(current_price, signal.ticker)
 
-            # Entry (parent) — LimitOrder, not transmitted until children are set
             entry_order = LimitOrder(
                 action=action,
                 totalQuantity=float(qty_decimal),
-                lmtPrice=entry,
-                orderId=parent_id,
-                transmit=False,
-                tif='GTC',
-            )
-
-            # Take Profit (child) — LimitOrder
-            tp_order = LimitOrder(
-                action=exit_action,
-                totalQuantity=float(qty_decimal),
-                lmtPrice=tp,
-                parentId=parent_id,
-                transmit=False,
-                tif='GTC',
-            )
-
-            # Stop Loss (child) — STP LMT instead of STP: Paxos does not support plain STP (Error 387)
-            # sl_limit_price is set 4 ticks worse than the stop trigger to ensure fill
-            sl_buffer = CRYPTO_TICK_SIZE.get(signal.ticker, 0.01) * SL_BUFFER_TICKS
-            sl_limit_price = (
-                _round_to_tick(sl - sl_buffer, signal.ticker)
-                if action == "BUY"
-                else _round_to_tick(sl + sl_buffer, signal.ticker)
-            )
-            sl_order = Order(
-                action=exit_action,
-                totalQuantity=float(qty_decimal),
-                orderType='STP LMT',
-                auxPrice=sl,
-                lmtPrice=sl_limit_price,
-                parentId=parent_id,
-                transmit=True,
-                tif='GTC',
+                lmtPrice=ioc_limit,
+                tif='IOC',
             )
 
             logger.info(
-                "[crypto] Building manual bracket (STP LMT) for Paxos: entry=%.2f, tp=%.2f, sl=%.2f, sl_lmt=%.2f",
-                entry, tp, sl, sl_limit_price,
+                "[crypto] Placing LimitOrder IOC %s %s qty=%.6f @ %.2f (TP=%.2f SL=%.2f)",
+                action, signal.ticker, float(qty_decimal), ioc_limit, tp, sl,
             )
 
-            # Validate entry price is reasonable for this symbol before placing
-            current_price = await self._get_current_price(signal.ticker)
-            if current_price > 0:
-                deviation = abs(entry - current_price) / current_price
-                if deviation > 0.05:  # more than 5% deviation from current price
-                    logger.error(
-                        "[crypto] Entry price %.2f deviates >5%% from current price %.2f for %s. Skipping.",
-                        entry,
-                        current_price,
-                        signal.ticker,
-                    )
-                    return None
-
-            self._pending_tickers.add(signal.ticker)  # set before placing to prevent duplicates
+            self._pending_tickers.add(signal.ticker)  # prevent duplicates before async place
             entry_trade = await self._connection.margin.place_order(contract, entry_order)
             if entry_trade is None:
                 self._pending_tickers.discard(signal.ticker)
                 return None
-            self._entry_trades[signal.ticker] = entry_trade
-            await self._connection.margin.place_order(contract, tp_order)
-            await self._connection.margin.place_order(contract, sl_order)
+
+            # Wait briefly for IOC to settle
+            await asyncio.sleep(2)
+
+            order_status = entry_trade.orderStatus
+            status = order_status.status if order_status is not None else ""
+            if status != "Filled":
+                logger.info(
+                    "[crypto] Entry not filled (IOC expired): %s %s @ %.2f — status=%s",
+                    action, signal.ticker, ioc_limit, status,
+                )
+                self._pending_tickers.discard(signal.ticker)
+                return None
+
+            fill_price = _round_to_tick(
+                float(order_status.avgFillPrice) if order_status.avgFillPrice else ioc_limit,
+                signal.ticker,
+            )
+            fill_qty = float(qty_decimal)
+
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Order error: %s", exc)
-            self._pending_tickers.discard(signal.ticker)  # clear so next cycle can retry
-            self._entry_trades.pop(signal.ticker, None)
+            self._pending_tickers.discard(signal.ticker)
             return None
+
+        # Entry confirmed — set up software-managed position
+        now_utc = datetime.now(timezone.utc)
+        self._active_position = CryptoPosition(
+            symbol=signal.ticker,
+            action=action,
+            qty=fill_qty,
+            entry_price=fill_price,
+            tp_price=tp,
+            sl_price=sl,
+            entry_time=now_utc,
+            order_id=entry_trade.order.orderId,
+        )
 
         position = Position(
             engine="crypto",
             ticker=signal.ticker,
             direction=direction,
-            entry_price=entry,
+            entry_price=fill_price,
             stop_price=sl,
             target_price=tp,
-            quantity=qty,
+            quantity=fill_qty,
+            entry_time=now_utc,
         )
         self._open_positions.append(position)
         self._risk.open_position("crypto", signal.ticker, direction)
+
+        logger.info(
+            "[crypto] Entry FILLED: %s %s qty=%.6f @ %.2f | TP=%.2f SL=%.2f",
+            action, signal.ticker, fill_qty, fill_price, tp, sl,
+        )
 
         if self._telegram:
             asyncio.create_task(
@@ -461,41 +484,144 @@ class CryptoEngine(BaseEngine):
                         "engine": "crypto",
                         "ticker": signal.ticker,
                         "direction": direction,
-                        "entry": entry,
+                        "entry": fill_price,
                         "sl": sl,
                         "tp": tp,
-                        "qty": qty,
+                        "qty": fill_qty,
                         "score": ai_score,
-                        "rr": round(abs(tp - entry) / abs(entry - sl), 2) if abs(entry - sl) > 0 else 0,
+                        "rr": round(abs(tp - fill_price) / abs(fill_price - sl), 2) if abs(fill_price - sl) > 0 else 0,
                     }
                 )
             )
         return None
 
-    def _get_exit_price_from_fills(self, ib: Any, position: Position) -> float:
-        """Look up the actual exit fill price for a closed position from IBKR fills.
+    async def _close_position(self, contract: Any, position: Position, reason: str, current_price: float) -> None:
+        """Close the active crypto position with a Market IOC (SL) or Limit IOC (TP) order."""
+        close_action = "SELL" if position.direction == "LONG" else "BUY"
+        qty_decimal = Decimal(str(position.quantity)).quantize(CRYPTO_QUANTITY_PRECISION, rounding=ROUND_DOWN)
+        if qty_decimal <= 0:
+            logger.error("[crypto] Cannot close %s: qty rounds to zero.", position.ticker)
+            return
 
-        For a LONG position the exit fill is a SELL (side="SLD").
-        For a SHORT position the exit fill is a BUY (side="BOT").
-        Falls back to the position's stop-loss price if no fill is found.
-        """
         try:
-            fills = ib.fills()
-            exit_side = "SLD" if position.direction == "LONG" else "BOT"
-            matching = [
-                f for f in fills
-                if f.contract.symbol == position.ticker and f.execution.side == exit_side
-            ]
-            if matching:
-                latest = max(matching, key=lambda f: f.execution.time)
-                return float(latest.execution.price)
+            if reason == "SL_HIT":
+                from ib_insync import MarketOrder  # type: ignore
+                order: Any = MarketOrder(
+                    action=close_action,
+                    totalQuantity=float(qty_decimal),
+                    tif='IOC',
+                )
+                logger.warning(
+                    "[crypto] 🛑 STOP LOSS HIT: %s @ %.2f (SL=%.2f) — closing with Market IOC",
+                    position.ticker, current_price, position.stop_price,
+                )
+            else:
+                from ib_insync import LimitOrder  # type: ignore
+                close_price = _round_to_tick(current_price, position.ticker)
+                order = LimitOrder(
+                    action=close_action,
+                    totalQuantity=float(qty_decimal),
+                    lmtPrice=close_price,
+                    tif='IOC',
+                )
+                logger.info(
+                    "[crypto] 🎯 TAKE PROFIT HIT: %s @ %.2f (TP=%.2f) — closing with Limit IOC",
+                    position.ticker, current_price, position.target_price,
+                )
+
+            trade = await self._connection.margin.place_order(contract, order)
+            if trade is None:
+                logger.error("[crypto] Close order placement failed for %s.", position.ticker)
+                return
+
+            await asyncio.sleep(2)
+
+            order_status = trade.orderStatus
+            status = order_status.status if order_status is not None else ""
+            if status != "Filled":
+                logger.error(
+                    "[crypto] Exit order not filled! Status=%s — will retry next cycle", status
+                )
+                return  # Don't clear position; retry next scan cycle
+
+            fill_price = float(order_status.avgFillPrice) if order_status.avgFillPrice else current_price
+
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[crypto] Could not get fill price for %s: %s; using SL fallback.", position.ticker, exc)
-        # Conservative fallback: assume stop-loss was hit
-        return position.stop_price
+            logger.error("[crypto] Close order error for %s: %s", position.ticker, exc)
+            return
+
+        # Position closed — record result
+        if position.direction == "LONG":
+            pnl = (fill_price - position.entry_price) * position.quantity
+        else:
+            pnl = (position.entry_price - fill_price) * position.quantity
+        won = pnl > 0
+
+        reto_result = RetoTradeResult(engine="crypto", pnl=pnl)
+        milestones = self._reto.update_capital(reto_result)
+
+        duration = (datetime.now(timezone.utc) - position.entry_time).total_seconds()
+        result = TradeResult(
+            engine="crypto",
+            ticker=position.ticker,
+            direction=position.direction,
+            entry_price=position.entry_price,
+            exit_price=fill_price,
+            stop_loss=position.stop_price,
+            take_profit=position.target_price,
+            quantity=position.quantity,
+            pnl=pnl,
+            pnl_pct=(
+                (pnl / (position.entry_price * position.quantity)) * 100
+                if position.entry_price > 0 and position.quantity > 0
+                else 0.0
+            ),
+            duration_seconds=duration,
+            setup_type="",
+            session=self._current_session(),
+            ai_score=0,
+            phase=self._reto.get_phase(),
+            capital_after=self._reto.capital,
+            won=won,
+        )
+        self._trade_history.append(result)
+
+        # Log to trade journal (daily summary)
+        if self._journal is not None:
+            try:
+                self._journal.log_trade(result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[crypto] Journal log error: %s", exc)
+
+        self._risk.register_trade(
+            engine="crypto",
+            pnl=pnl,
+            won=won,
+            direction=position.direction,
+            ticker=position.ticker,
+        )
+
+        # Clean up position state
+        self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
+        self._risk.close_position("crypto", position.ticker)
+        self._pending_tickers.discard(position.ticker)
+        self._active_position = None
+
+        logger.info(
+            "[crypto] Position closed: %s %s | Entry=%.2f Exit=%.2f | P&L=$%.2f | Reason=%s",
+            position.ticker, "WIN" if won else "LOSS",
+            position.entry_price, fill_price, pnl, reason,
+        )
+
+        if self._telegram:
+            asyncio.create_task(self._telegram.send_trade_exit(result))
+
+        for msg in milestones:
+            if self._telegram:
+                asyncio.create_task(self._telegram.send_milestone_alert(msg))
 
     async def _force_close_position(self, ib: Any, position: Position) -> None:
-        """Cancel all open orders for a position and flatten with a market order.
+        """Cancel any open orders and flatten the position with a Market IOC order.
 
         Used at 9:00 AM ET to free capital before the RTH open.
         """
@@ -517,8 +643,7 @@ class CryptoEngine(BaseEngine):
 
             await asyncio.sleep(1)  # brief pause for cancels to propagate
 
-            # Place a market order to flatten the position
-            from ib_insync import Order  # type: ignore
+            from ib_insync import MarketOrder  # type: ignore
 
             close_action = "SELL" if position.direction == "LONG" else "BUY"
             qty_decimal = Decimal(str(position.quantity)).quantize(
@@ -527,23 +652,23 @@ class CryptoEngine(BaseEngine):
             if qty_decimal <= 0:
                 logger.error("[crypto] Cannot force-close %s: qty rounds to zero.", position.ticker)
                 return
-            market_order = Order(
+            # Paxos requires tif='IOC' for Market orders
+            market_order = MarketOrder(
                 action=close_action,
                 totalQuantity=float(qty_decimal),
-                orderType="MKT",
-                tif="GTC",
+                tif='IOC',
             )
             await self._connection.margin.place_order(contract, market_order)
             logger.warning(
-                "[crypto] Market close order placed for %s qty=%.6f.",
+                "[crypto] Market IOC close order placed for %s qty=%.6f.",
                 position.ticker, float(qty_decimal),
             )
 
-            # Remove the position from tracking immediately (fill will be confirmed via monitor)
+            # Remove the position from tracking immediately
             self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
             self._risk.close_position("crypto", position.ticker)
             self._pending_tickers.discard(position.ticker)
-            self._entry_trades.pop(position.ticker, None)
+            self._active_position = None
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Force-close error for %s: %s", position.ticker, exc)
 
@@ -552,7 +677,7 @@ class CryptoEngine(BaseEngine):
         if ib is None:
             return
         try:
-            # Fix 3: Force-close overnight crypto positions at 9:00 AM ET to free capital for RTH
+            # Force-close overnight crypto positions at 9:00 AM ET to free capital for RTH
             _now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
             if _now.weekday() < 5 and _now.hour == 9 and _now.minute < 5:
                 logger.warning(
@@ -560,98 +685,43 @@ class CryptoEngine(BaseEngine):
                 )
                 await self._force_close_position(ib, position)
                 return
-            # If the entry order was cancelled or rejected, clean up immediately
-            entry_trade = self._entry_trades.get(position.ticker)
-            if entry_trade is not None:
-                order_status = entry_trade.orderStatus
-                entry_status = order_status.status if order_status is not None else ""
-                if entry_status in ("Cancelled", "Inactive"):
-                    self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
-                    self._risk.close_position("crypto", position.ticker)
-                    self._pending_tickers.discard(position.ticker)
-                    self._entry_trades.pop(position.ticker, None)
-                    logger.warning(
-                        "[crypto] Entry order %s for %s — clearing pending flag.",
-                        entry_status.lower(),
-                        position.ticker,
-                    )
-                    return
 
-            open_trades = ib.openTrades()
-            symbol_trades = [t for t in open_trades if t.contract.symbol == position.ticker]
-            if not symbol_trades:
-                # Determine exit price from IBKR fills
-                exit_price = self._get_exit_price_from_fills(ib, position)
-
-                # Calculate realised P&L (no multiplier for crypto spot)
-                if position.direction == "LONG":
-                    pnl = (exit_price - position.entry_price) * position.quantity
-                else:
-                    pnl = (position.entry_price - exit_price) * position.quantity
-
-                won = pnl > 0
-
-                # Update capital tracker
-                reto_result = RetoTradeResult(engine="crypto", pnl=pnl)
-                milestones = self._reto.update_capital(reto_result)
-
-                # Build a full TradeResult for the trade journal and Telegram
-                result = TradeResult(
-                    engine="crypto",
-                    ticker=position.ticker,
-                    direction=position.direction,
-                    entry_price=position.entry_price,
-                    exit_price=exit_price,
-                    stop_loss=position.stop_price,
-                    take_profit=position.target_price,
-                    quantity=position.quantity,
-                    pnl=pnl,
-                    pnl_pct=(
-                        (pnl / (position.entry_price * position.quantity)) * 100
-                        if position.entry_price > 0
-                        else 0.0
-                    ),
-                    duration_seconds=(datetime.utcnow() - position.entry_time).total_seconds(),
-                    setup_type="",
-                    session=self._current_session(),
-                    ai_score=0,
-                    phase=self._reto.get_phase(),
-                    capital_after=self._reto.capital,
-                    won=won,
+            # Time-based stop: close position if it has been open > 30 minutes
+            age_secs = (datetime.now(timezone.utc) - position.entry_time).total_seconds()
+            if age_secs > CRYPTO_MAX_POSITION_AGE_SECS:
+                logger.warning(
+                    "[crypto] Position %s open for %.0f min — closing at market (time-based stop).",
+                    position.ticker, age_secs / 60,
                 )
-                self._trade_history.append(result)
+                contract = self._get_contract(position.ticker)
+                current_price = await self._get_current_price(position.ticker)
+                if contract is not None:
+                    await self._close_position(contract, position, "TIME_STOP", current_price)
+                return
 
-                # Notify risk manager so consecutive-loss counter and daily trade count update
-                self._risk.register_trade(
-                    engine="crypto",
-                    pnl=pnl,
-                    won=won,
-                    direction=position.direction,
-                    ticker=position.ticker,
-                )
+            # Fetch current price for TP/SL comparison
+            current_price = await self._get_current_price(position.ticker)
+            if current_price <= 0:
+                logger.debug("[crypto] Could not fetch price for %s — skipping TP/SL check.", position.ticker)
+                return
 
-                # Clean up position state
-                self._open_positions = [p for p in self._open_positions if p.ticker != position.ticker]
-                self._risk.close_position("crypto", position.ticker)
-                self._pending_tickers.discard(position.ticker)
-                self._entry_trades.pop(position.ticker, None)
+            exit_reason: str | None = None
 
-                logger.info(
-                    "[crypto] Position closed: %s %s P&L=%.2f exit=%.2f",
-                    position.ticker,
-                    "WIN" if won else "LOSS",
-                    pnl,
-                    exit_price,
-                )
+            if position.direction == "LONG":
+                if current_price >= position.target_price:
+                    exit_reason = "TP_HIT"
+                elif current_price <= position.stop_price:
+                    exit_reason = "SL_HIT"
+            else:  # SHORT
+                if current_price <= position.target_price:
+                    exit_reason = "TP_HIT"
+                elif current_price >= position.stop_price:
+                    exit_reason = "SL_HIT"
 
-                # Telegram exit notification
-                if self._telegram:
-                    asyncio.create_task(self._telegram.send_trade_exit(result))
-
-                # Milestone alerts
-                for msg in milestones:
-                    if self._telegram:
-                        asyncio.create_task(self._telegram.send_milestone_alert(msg))
+            if exit_reason:
+                contract = self._get_contract(position.ticker)
+                if contract is not None:
+                    await self._close_position(contract, position, exit_reason, current_price)
 
         except Exception as exc:  # noqa: BLE001
             logger.error("[crypto] Monitor error: %s", exc)

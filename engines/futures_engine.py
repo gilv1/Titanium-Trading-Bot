@@ -89,6 +89,7 @@ class FuturesEngine(BaseEngine):
         reto_tracker: "RetoTracker",
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
+        journal: "Any | None" = None,
     ) -> None:
         super().__init__(
             connection_manager=connection_manager,
@@ -97,6 +98,7 @@ class FuturesEngine(BaseEngine):
             risk_manager=risk_manager,
             telegram=telegram,
             loop_interval=60.0,
+            journal=journal,
         )
         self._orb_range: tuple[float, float] | None = None  # (low, high)
         self._session_open_time: datetime | None = None

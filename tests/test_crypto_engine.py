@@ -1,10 +1,11 @@
 """
-Tests for engines/crypto_engine.py — tick rounding, dynamic allocation, pre-RTH cutoff.
+Tests for engines/crypto_engine.py — tick rounding, dynamic allocation, pre-RTH cutoff,
+and the software-managed IOC order architecture.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -12,9 +13,10 @@ import pytest
 
 from engines.crypto_engine import (
     CryptoEngine,
+    CryptoPosition,
     CRYPTO_TICK_SIZE,
     CRYPTO_MIN_QTY,
-    SL_BUFFER_TICKS,
+    CRYPTO_MAX_POSITION_AGE_SECS,
     _round_to_tick,
 )
 
@@ -183,89 +185,143 @@ class TestEffectiveAllocation:
 
 
 # ──────────────────────────────────────────────────────────────
-# Fix 3: SL order uses STP LMT instead of STP (Error 387 fix)
+# New architecture: IOC entry and software-managed TP/SL orders
 # ──────────────────────────────────────────────────────────────
 
 
-class TestSLOrderType:
-    """Verify that the stop-loss child order is built as STP LMT, not STP.
+class TestCryptoPosition:
+    """CryptoPosition dataclass captures the fields needed for software TP/SL monitoring."""
 
-    IBKR Paxos does not support plain STP orders for crypto (Error 387).
-    """
-
-    def _build_sl_order(self, action: str, sl: float, ticker: str) -> "Any":
-        """
-        Simulate the SL order construction logic from execute_trade() so we can
-        assert the order type without running the full async pipeline.
-        """
-        from ib_insync import Order  # type: ignore
-
-        sl_buffer = CRYPTO_TICK_SIZE.get(ticker, 0.01) * SL_BUFFER_TICKS
-        sl_limit_price = (
-            _round_to_tick(sl - sl_buffer, ticker)
-            if action == "BUY"
-            else _round_to_tick(sl + sl_buffer, ticker)
+    def test_fields_are_set(self):
+        now = datetime.now(timezone.utc)
+        pos = CryptoPosition(
+            symbol="BTC",
+            action="BUY",
+            qty=0.001,
+            entry_price=70000.00,
+            tp_price=72450.00,
+            sl_price=68950.00,
+            entry_time=now,
+            order_id=1234,
         )
-        sl_order = Order(
-            action="SELL" if action == "BUY" else "BUY",
-            totalQuantity=0.001,
-            orderType='STP LMT',
-            auxPrice=sl,
-            lmtPrice=sl_limit_price,
-            parentId=1,
-            transmit=True,
-            tif='GTC',
+        assert pos.symbol == "BTC"
+        assert pos.action == "BUY"
+        assert pos.qty == pytest.approx(0.001)
+        assert pos.entry_price == pytest.approx(70000.00)
+        assert pos.tp_price == pytest.approx(72450.00)
+        assert pos.sl_price == pytest.approx(68950.00)
+        assert pos.entry_time == now
+        assert pos.order_id == 1234
+
+    def test_initial_active_position_is_none(self):
+        engine = _make_engine()
+        assert engine._active_position is None
+
+
+class TestIOCEntryOrder:
+    """Verify the IOC LimitOrder entry construction for IBKR Paxos compliance."""
+
+    def _build_entry_order(self, action: str, qty: float, limit_price: float) -> "Any":
+        from ib_insync import LimitOrder  # type: ignore
+
+        limit = _round_to_tick(limit_price, "BTC")
+        return LimitOrder(
+            action=action,
+            totalQuantity=qty,
+            lmtPrice=limit,
+            tif='IOC',
         )
-        return sl_order
 
-    def test_sl_order_type_is_stp_lmt_for_btc_long(self):
-        """BTC LONG trade: SL child must be STP LMT, not STP."""
-        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
-        assert sl_order.orderType == 'STP LMT', (
-            f"Expected STP LMT but got {sl_order.orderType!r} — Paxos rejects plain STP (Error 387)"
+    def test_entry_order_type_is_limit(self):
+        """Entry order must be a LimitOrder (not MKT, STP, or STP LMT)."""
+        order = self._build_entry_order("BUY", 0.001, 70000.00)
+        assert order.orderType == "LMT"
+
+    def test_entry_tif_is_ioc(self):
+        """Paxos requires TIF=IOC for Limit orders."""
+        order = self._build_entry_order("BUY", 0.001, 70000.00)
+        assert order.tif == "IOC"
+
+    def test_entry_limit_price_is_rounded(self):
+        """Entry limit price must conform to tick increments."""
+        order = self._build_entry_order("BUY", 0.001, 70482.72)
+        assert order.lmtPrice == 70482.75
+
+    def test_entry_sell_order(self):
+        """SHORT entry produces a SELL LimitOrder IOC."""
+        order = self._build_entry_order("SELL", 0.001, 70000.00)
+        assert order.action == "SELL"
+        assert order.orderType == "LMT"
+        assert order.tif == "IOC"
+
+    def test_no_bracket_orders_on_engine(self):
+        """After construction, no bracket order state (_entry_trades) exists."""
+        engine = _make_engine()
+        assert not hasattr(engine, "_entry_trades")
+
+
+class TestCloseOrders:
+    """Verify the close order construction for TP and SL exits."""
+
+    def _build_tp_close_order(self, close_action: str, qty: float, current_price: float, ticker: str) -> "Any":
+        from ib_insync import LimitOrder  # type: ignore
+
+        close_price = _round_to_tick(current_price, ticker)
+        return LimitOrder(
+            action=close_action,
+            totalQuantity=qty,
+            lmtPrice=close_price,
+            tif='IOC',
         )
 
-    def test_sl_order_type_is_stp_lmt_for_btc_short(self):
-        """BTC SHORT trade: SL child must be STP LMT, not STP."""
-        sl_order = self._build_sl_order("SELL", sl=68000.00, ticker="BTC")
-        assert sl_order.orderType == 'STP LMT'
+    def _build_sl_close_order(self, close_action: str, qty: float) -> "Any":
+        from ib_insync import MarketOrder  # type: ignore
 
-    def test_sl_limit_price_is_below_stop_for_long(self):
-        """For a LONG position the SL limit price must be ≤ the stop trigger price."""
-        sl = 67077.75
-        ticker = "BTC"
-        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS
-        sl_limit_price = _round_to_tick(sl - sl_buffer, ticker)
-        assert sl_limit_price < sl
+        return MarketOrder(
+            action=close_action,
+            totalQuantity=qty,
+            tif='IOC',
+        )
 
-    def test_sl_limit_price_is_above_stop_for_short(self):
-        """For a SHORT position the SL limit price must be ≥ the stop trigger price."""
-        sl = 68000.00
-        ticker = "BTC"
-        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS
-        sl_limit_price = _round_to_tick(sl + sl_buffer, ticker)
-        assert sl_limit_price > sl
+    def test_tp_close_is_limit_ioc(self):
+        """Take-profit close must use LimitOrder with TIF=IOC."""
+        order = self._build_tp_close_order("SELL", 0.001, 72450.25, "BTC")
+        assert order.orderType == "LMT"
+        assert order.tif == "IOC"
 
-    def test_sl_auxprice_matches_sl_trigger(self):
-        """The auxPrice on the SL order must equal the SL trigger price."""
-        sl = 67077.75
-        sl_order = self._build_sl_order("BUY", sl=sl, ticker="BTC")
-        assert sl_order.auxPrice == sl
+    def test_tp_close_price_is_rounded(self):
+        """TP close limit price must be on a valid BTC tick."""
+        order = self._build_tp_close_order("SELL", 0.001, 72450.13, "BTC")
+        assert order.lmtPrice == 72450.25
 
-    def test_sl_transmit_is_true(self):
-        """The SL order must have transmit=True (last child triggers the bracket)."""
-        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
-        assert sl_order.transmit is True
+    def test_sl_close_is_market_ioc(self):
+        """Stop-loss close must use MarketOrder with TIF=IOC for guaranteed exit."""
+        order = self._build_sl_close_order("SELL", 0.001)
+        assert order.orderType == "MKT"
+        assert order.tif == "IOC"
 
-    def test_sl_tif_is_gtc(self):
-        """The SL order must use TIF=GTC."""
-        sl_order = self._build_sl_order("BUY", sl=67077.75, ticker="BTC")
-        assert sl_order.tif == 'GTC'
+    def test_sl_close_sell_for_long(self):
+        """LONG position SL close must be a SELL."""
+        order = self._build_sl_close_order("SELL", 0.001)
+        assert order.action == "SELL"
 
-    def test_sl_eth_limit_price_uses_eth_tick(self):
-        """ETH SL limit price buffer uses $0.01 tick, not BTC's $0.25."""
-        sl = 3250.00
-        ticker = "ETH"
-        sl_buffer = CRYPTO_TICK_SIZE[ticker] * SL_BUFFER_TICKS   # 4 × $0.01 = $0.04
-        sl_limit_price = _round_to_tick(sl - sl_buffer, ticker)
-        assert sl_limit_price == pytest.approx(3249.96, abs=0.001)
+    def test_sl_close_buy_for_short(self):
+        """SHORT position SL close must be a BUY."""
+        order = self._build_sl_close_order("BUY", 0.001)
+        assert order.action == "BUY"
+
+    def test_tp_close_sell_for_long(self):
+        """LONG position TP close must be a SELL LimitOrder IOC."""
+        order = self._build_tp_close_order("SELL", 0.001, 72450.00, "BTC")
+        assert order.action == "SELL"
+
+    def test_eth_tp_close_price_uses_eth_tick(self):
+        """ETH TP close price uses $0.01 tick, not BTC's $0.25."""
+        order = self._build_tp_close_order("SELL", 0.01, 3250.127, "ETH")
+        assert order.lmtPrice == pytest.approx(3250.13, abs=0.001)
+
+
+class TestMaxPositionAge:
+    def test_max_position_age_is_30_minutes(self):
+        """Software time-based stop triggers after 30 minutes."""
+        assert CRYPTO_MAX_POSITION_AGE_SECS == 30 * 60
