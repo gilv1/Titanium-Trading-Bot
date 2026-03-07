@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,9 @@ CRYPTO_MAX_POSITION_AGE_SECS = 30 * 60  # 30 minutes
 
 # Minimum time (seconds) between entry attempts for the same symbol
 ENTRY_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Maximum acceptable deviation between IBKR price and external scanner price (0.5%)
+PRICE_CROSS_VALIDATION_THRESHOLD = 0.005
 
 
 def _round_to_tick(price: float, symbol: str) -> float:
@@ -289,8 +293,8 @@ class CryptoEngine(BaseEngine):
 
         return setups
 
-    async def _get_current_price(self, symbol: str) -> float:
-        """Fetch the current market price for a crypto symbol."""
+    async def _get_ibkr_price(self, symbol: str) -> float:
+        """Fetch price from IBKR using reqMktData with bid/ask preference."""
         contract = self._get_contract(symbol)
         if contract is None:
             return 0.0
@@ -300,12 +304,66 @@ class CryptoEngine(BaseEngine):
         try:
             ticker = ib.reqMktData(contract, '', False, False)
             await asyncio.sleep(2)
-            price = float(ticker.last or ticker.close or ticker.midpoint() or 0)
+            # Prefer bid/ask midpoint over last/close (more current)
+            mid = ticker.midpoint()
+            if mid and mid > 0 and not math.isnan(mid):
+                price = float(mid)
+            elif ticker.ask and ticker.ask > 0 and ticker.bid and ticker.bid > 0:
+                price = float((ticker.ask + ticker.bid) / 2)
+            elif ticker.last and ticker.last > 0:
+                price = float(ticker.last)
+            elif ticker.close and ticker.close > 0:
+                price = float(ticker.close)
+            else:
+                price = 0.0
             ib.cancelMktData(contract)
             return price
         except Exception as exc:  # noqa: BLE001
-            logger.error("[crypto] Error fetching current price for %s: %s", symbol, exc)
+            logger.error("[crypto] Error fetching IBKR price for %s: %s", symbol, exc)
             return 0.0
+
+    async def _get_current_price(self, symbol: str) -> float:
+        """Fetch current price with cross-validation against external scanners.
+
+        Uses multiple price sources and returns the most reliable price.
+        If IBKR price deviates >0.5% from external sources, uses external price.
+        If no reliable price can be determined, returns 0.0 (which blocks the trade).
+        """
+        # Source 1: IBKR (may be stale)
+        ibkr_price = await self._get_ibkr_price(symbol)
+
+        # Source 2: External scanner (real-time)
+        external_price = 0.0
+        try:
+            context = await self._scanner.get_market_context(symbol)
+            if context is not None and context.price > 0:
+                external_price = context.price
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[crypto] Scanner price fetch failed: %s", exc)
+
+        # Cross-validate
+        if ibkr_price > 0 and external_price > 0:
+            deviation = abs(ibkr_price - external_price) / external_price
+            if deviation > PRICE_CROSS_VALIDATION_THRESHOLD:
+                logger.warning(
+                    "[crypto] PRICE MISMATCH: IBKR=%.2f vs External=%.2f (%.2f%% deviation) — using external price",
+                    ibkr_price, external_price, deviation * 100,
+                )
+                return external_price  # Trust external over stale IBKR
+            # Both agree — use IBKR (it's the exchange we're trading on)
+            return ibkr_price
+
+        # Only one source available
+        if external_price > 0:
+            logger.info("[crypto] Using external price for %s: $%.2f (IBKR unavailable)", symbol, external_price)
+            return external_price
+        if ibkr_price > 0:
+            logger.info("[crypto] Using IBKR-only price for %s: $%.2f (external unavailable)", symbol, ibkr_price)
+            return ibkr_price
+
+        # No reliable price — block the trade
+        logger.error("[crypto] NO RELIABLE PRICE for %s — blocking trade", symbol)
+        return 0.0
 
     async def execute_trade(
         self,
@@ -443,14 +501,30 @@ class CryptoEngine(BaseEngine):
                 logger.warning("[crypto] Could not fetch current price for %s — skipping IOC entry.", signal.ticker)
                 return None
 
-            # Reject if signal price is stale (>5% from current market)
+            # Reject if signal price is stale (>1% from current market)
             deviation = abs(entry - current_price) / current_price
-            if deviation > 0.05:
+            if deviation > 0.01:
                 logger.error(
-                    "[crypto] Entry price %.2f deviates >5%% from current price %.2f for %s. Skipping.",
+                    "[crypto] Entry price %.2f deviates >1%% from current price %.2f for %s. Skipping.",
                     entry, current_price, signal.ticker,
                 )
                 return None
+
+            # Final sanity check: recalculate SL/TP from validated price if signal entry
+            # deviates more than 0.5% from the cross-validated current price.
+            entry_deviation = abs(entry - current_price) / current_price
+            if entry_deviation > PRICE_CROSS_VALIDATION_THRESHOLD:
+                logger.warning(
+                    "[crypto] Signal entry $%.2f is %.2f%% from validated price $%.2f — using validated price as entry basis",
+                    entry, entry_deviation * 100, current_price,
+                )
+                entry = _round_to_tick(current_price, signal.ticker)
+                if direction == "LONG":
+                    sl = _round_to_tick(entry - sl_distance, signal.ticker)
+                    tp = _round_to_tick(entry + tp_distance, signal.ticker)
+                else:
+                    sl = _round_to_tick(entry + sl_distance, signal.ticker)
+                    tp = _round_to_tick(entry - tp_distance, signal.ticker)
 
             # Price the IOC limit 2 ticks above ask (BUY) or below bid (SELL) to
             # guarantee fill while staying close to the current market.

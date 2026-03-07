@@ -1,9 +1,9 @@
 """
 ScannerPool — Multi-API rotation system for external market confirmation.
 
-Rotates between free crypto APIs (CoinCap, CoinLore, CoinGecko) to provide
-market-context validation before placing trades.  Automatically handles rate
-limits, errors, and back-off without blocking the trading loop.
+Rotates between free crypto APIs (CoinCap, CoinLore, CoinGecko, FreeCryptoAPI)
+to provide market-context validation before placing trades.  Automatically
+handles rate limits, errors, and back-off without blocking the trading loop.
 """
 
 from __future__ import annotations
@@ -58,6 +58,9 @@ class MarketContext:
         # RSI not overbought (only checked when available)
         if self.rsi is not None:
             checks.append(self.rsi < 72)
+        # MACD must not be bearish (only checked when available)
+        if self.macd_signal is not None:
+            checks.append(self.macd_signal != "bearish")  # allow "bullish" and "neutral"
         # Volume is present — not a dead / illiquid market
         checks.append(self.volume_24h > 1_000_000_000)  # $1B minimum for BTC/ETH
         return all(checks)
@@ -73,6 +76,9 @@ class MarketContext:
         # RSI not oversold (only checked when available)
         if self.rsi is not None:
             checks.append(self.rsi > 28)
+        # MACD must not be bullish (only checked when available)
+        if self.macd_signal is not None:
+            checks.append(self.macd_signal != "bullish")  # allow "bearish" and "neutral"
         # Volume is present
         checks.append(self.volume_24h > 1_000_000_000)
         return all(checks)
@@ -87,9 +93,10 @@ class ScannerPool:
     """Rotates between multiple free crypto APIs automatically.
 
     Priority order (highest capacity first):
-        1. CoinLore  — unlimited, no key required
-        2. CoinCap   — 500 req/min with free key
-        3. CoinGecko — 30 req/min with free demo key
+        1. CoinLore     — unlimited, no key required
+        2. CoinCap      — 500 req/min with free key
+        3. CoinGecko    — 30 req/min with free demo key
+        4. FreeCryptoAPI — ~100 req/min (using 80% capacity); provides RSI + MACD
 
     The pool resets per-minute counters every 60 s and temporarily disables
     any scanner that produces 3+ consecutive errors (120 s cool-down).
@@ -97,9 +104,10 @@ class ScannerPool:
 
     def __init__(self) -> None:
         self._scanners: list[ScannerStatus] = [
-            ScannerStatus("coinlore", calls_per_min=900),  # effectively unlimited
-            ScannerStatus("coincap", calls_per_min=450),   # 90% of 500 limit
-            ScannerStatus("coingecko", calls_per_min=25),  # 83% of 30 limit
+            ScannerStatus("coinlore", calls_per_min=900),    # effectively unlimited
+            ScannerStatus("coincap", calls_per_min=450),     # 90% of 500 limit
+            ScannerStatus("coingecko", calls_per_min=25),    # 83% of 30 limit
+            ScannerStatus("freecrypto", calls_per_min=80),   # ~100/min actual, use 80% capacity
         ]
         self._client = httpx.AsyncClient(timeout=10.0)
 
@@ -160,6 +168,8 @@ class ScannerPool:
                     result = await self._fetch_coincap(symbol)
                 elif scanner.name == "coingecko":
                     result = await self._fetch_coingecko(symbol)
+                elif scanner.name == "freecrypto":
+                    result = await self._fetch_freecrypto(symbol)
                 else:
                     logger.warning("[scanner] Unknown scanner '%s' — skipping", scanner.name)
                     return None
@@ -246,4 +256,56 @@ class ScannerPool:
             volume_24h=float(data.get("usd_24h_vol") or 0),
             change_1h=0.0,  # CoinGecko free tier does not provide 1h change
             change_24h=float(data.get("usd_24h_change") or 0),
+        )
+
+    async def _fetch_freecrypto(self, symbol: str) -> MarketContext:
+        """FreeCryptoAPI — provides RSI + MACD technical indicators."""
+        coin = "BTC" if symbol == "BTC" else "ETH"
+        headers: dict[str, str] = {}
+        api_key = getattr(settings, "FREECRYPTO_API_KEY", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        resp = await self._client.get(
+            f"https://api.freecryptoapi.com/v1/getData?symbol={coin}USDT",
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        price = float(data.get("price", 0) or 0)
+        volume = float(data.get("volume_24h", 0) or 0)
+        change_24h = float(data.get("percent_change_24h", 0) or 0)
+        change_1h = float(data.get("percent_change_1h", 0) or 0)
+
+        # Technical indicators (FreeCryptoAPI unique feature)
+        rsi: float | None = None
+        macd_signal: str | None = None
+        try:
+            indicators = data.get("indicators", {})
+            if indicators:
+                rsi_val = indicators.get("rsi")
+                if rsi_val is not None:
+                    rsi = float(rsi_val)
+                macd_data = indicators.get("macd", {})
+                if macd_data:
+                    macd_hist = float(macd_data.get("histogram", 0) or 0)
+                    if macd_hist > 0:
+                        macd_signal = "bullish"
+                    elif macd_hist < 0:
+                        macd_signal = "bearish"
+                    else:
+                        macd_signal = "neutral"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[scanner] freecrypto indicator parse error: %s", exc)
+            rsi = None
+            macd_signal = None
+
+        return MarketContext(
+            price=price,
+            volume_24h=volume,
+            change_1h=change_1h,
+            change_24h=change_24h,
+            rsi=rsi,
+            macd_signal=macd_signal,
         )

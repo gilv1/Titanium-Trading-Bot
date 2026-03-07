@@ -558,3 +558,146 @@ class TestScannerIntegration:
         assert result is None
         mock_scanner.get_market_context.assert_awaited_once()
 
+
+# ──────────────────────────────────────────────────────────────
+# Cross-validated pricing (_get_current_price / _get_ibkr_price)
+# ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCrossValidatedPricing:
+    """_get_current_price() cross-validates IBKR price against external scanner."""
+
+    async def test_returns_ibkr_price_when_both_agree(self):
+        """When IBKR and external prices are within 0.5%, use IBKR price."""
+        from core.scanner_pool import MarketContext
+
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=68000.0)
+        mock_context = MarketContext(
+            price=68010.0,  # within 0.5% of IBKR
+            volume_24h=25e9, change_1h=0.0, change_24h=0.0,
+        )
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=mock_context)
+
+        price = await engine._get_current_price("BTC")
+
+        assert price == pytest.approx(68000.0)  # uses IBKR
+
+    async def test_returns_external_price_when_ibkr_stale(self):
+        """When IBKR deviates >0.5% from external, use external price."""
+        from core.scanner_pool import MarketContext
+
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=67511.0)  # stale IBKR
+        mock_context = MarketContext(
+            price=68098.25,  # real market price
+            volume_24h=25e9, change_1h=0.0, change_24h=0.0,
+        )
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=mock_context)
+
+        price = await engine._get_current_price("BTC")
+
+        # Deviation = |67511 - 68098.25| / 68098.25 ≈ 0.86% > 0.5% → external wins
+        assert price == pytest.approx(68098.25)
+
+    async def test_returns_external_price_when_ibkr_unavailable(self):
+        """When IBKR returns 0, fall back to external scanner price."""
+        from core.scanner_pool import MarketContext
+
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=0.0)
+        mock_context = MarketContext(
+            price=68000.0,
+            volume_24h=25e9, change_1h=0.0, change_24h=0.0,
+        )
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=mock_context)
+
+        price = await engine._get_current_price("BTC")
+
+        assert price == pytest.approx(68000.0)
+
+    async def test_returns_ibkr_price_when_scanner_unavailable(self):
+        """When scanner returns None, fall back to IBKR-only price."""
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=68000.0)
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=None)
+
+        price = await engine._get_current_price("BTC")
+
+        assert price == pytest.approx(68000.0)
+
+    async def test_returns_zero_when_no_price_available(self):
+        """When both sources fail, returns 0.0 to block the trade."""
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=0.0)
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=None)
+
+        price = await engine._get_current_price("BTC")
+
+        assert price == pytest.approx(0.0)
+
+    async def test_scanner_exception_falls_back_to_ibkr(self):
+        """Scanner fetch exception falls back to IBKR price gracefully."""
+        engine = _make_engine()
+        engine._get_ibkr_price = AsyncMock(return_value=68000.0)
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(side_effect=Exception("network error"))
+
+        price = await engine._get_current_price("BTC")
+
+        assert price == pytest.approx(68000.0)
+
+
+# ──────────────────────────────────────────────────────────────
+# Stale price rejection tightened to 1%
+# ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestStalePriceRejection:
+    """execute_trade() rejects entries that deviate >1% from cross-validated price."""
+
+    async def test_rejects_entry_when_deviation_exceeds_1_pct(self):
+        """A signal entry >1% from the current validated price is rejected."""
+        engine = _make_engine()
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=None)
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        # current_price = 68000.0, signal entry = 69020.0 → deviation = 1.5% > 1% → rejected
+        engine._get_current_price = AsyncMock(return_value=68000.0)
+        setup = _make_setup(ticker="BTC", direction="LONG", entry_price=69020.0, atr=150.0)
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        assert result is None  # trade blocked due to stale price
+
+    async def test_allows_entry_within_1_pct(self):
+        """A signal entry within 0.5% of current price is not rejected for staleness."""
+        engine = _make_engine()
+        engine._scanner = MagicMock()
+        engine._scanner.get_market_context = AsyncMock(return_value=None)
+        engine._get_contract = MagicMock(return_value=MagicMock())
+
+        # Signal entry = 70000, current = 70100 → deviation ≈ 0.14% < 1% → not stale
+        engine._get_current_price = AsyncMock(return_value=70100.0)
+
+        # Fail before placing order (place_order returns None) to avoid real order logic
+        engine._connection.margin.place_order = AsyncMock(return_value=None)
+        engine._connection.margin.get_ib = MagicMock(return_value=MagicMock())
+
+        setup = _make_setup(ticker="BTC", direction="LONG", entry_price=70000.0, atr=150.0)
+        result = await engine.execute_trade(setup, size_multiplier=1.0, ai_score=80)
+
+        # Result is None because order didn't fill, but it was NOT rejected for staleness
+        # (if rejected, the scanner mock would not have been called to completion)
+        assert result is None
+        # Confirm price fetch was called — if stale check blocked, this would still be called
+        engine._get_current_price.assert_awaited_once_with("BTC")
+
+

@@ -21,13 +21,14 @@ from core.scanner_pool import MarketContext, ScannerPool, ScannerStatus
 class TestMarketContextBullish:
     """MarketContext.is_bullish_context should pass only when market looks healthy for LONG."""
 
-    def _ctx(self, change_1h=0.5, change_24h=1.0, volume_24h=5e9, rsi=None) -> MarketContext:
+    def _ctx(self, change_1h=0.5, change_24h=1.0, volume_24h=5e9, rsi=None, macd_signal=None) -> MarketContext:
         return MarketContext(
             price=50000.0,
             volume_24h=volume_24h,
             change_1h=change_1h,
             change_24h=change_24h,
             rsi=rsi,
+            macd_signal=macd_signal,
         )
 
     def test_healthy_market_is_bullish(self):
@@ -58,6 +59,22 @@ class TestMarketContextBullish:
         """When RSI is None the check is simply skipped."""
         assert self._ctx(rsi=None).is_bullish_context is True
 
+    def test_bearish_macd_rejects_bullish(self):
+        """MACD 'bearish' signal rejects a LONG entry."""
+        assert self._ctx(macd_signal="bearish").is_bullish_context is False
+
+    def test_neutral_macd_allows_bullish(self):
+        """MACD 'neutral' signal allows a LONG entry."""
+        assert self._ctx(macd_signal="neutral").is_bullish_context is True
+
+    def test_bullish_macd_allows_bullish(self):
+        """MACD 'bullish' signal allows a LONG entry."""
+        assert self._ctx(macd_signal="bullish").is_bullish_context is True
+
+    def test_none_macd_skips_macd_check(self):
+        """When macd_signal is None the MACD check is skipped."""
+        assert self._ctx(macd_signal=None).is_bullish_context is True
+
     def test_low_volume_rejected(self):
         """Volume below $1 B → dead market, not bullish."""
         assert self._ctx(volume_24h=999_999_999).is_bullish_context is False
@@ -77,13 +94,14 @@ class TestMarketContextBullish:
 class TestMarketContextBearish:
     """MarketContext.is_bearish_context should pass only when market looks healthy for SHORT."""
 
-    def _ctx(self, change_1h=-0.5, change_24h=-1.0, volume_24h=5e9, rsi=None) -> MarketContext:
+    def _ctx(self, change_1h=-0.5, change_24h=-1.0, volume_24h=5e9, rsi=None, macd_signal=None) -> MarketContext:
         return MarketContext(
             price=50000.0,
             volume_24h=volume_24h,
             change_1h=change_1h,
             change_24h=change_24h,
             rsi=rsi,
+            macd_signal=macd_signal,
         )
 
     def test_healthy_market_is_bearish(self):
@@ -108,6 +126,22 @@ class TestMarketContextBearish:
 
     def test_no_rsi_skips_check(self):
         assert self._ctx(rsi=None).is_bearish_context is True
+
+    def test_bullish_macd_rejects_bearish(self):
+        """MACD 'bullish' signal rejects a SHORT entry."""
+        assert self._ctx(macd_signal="bullish").is_bearish_context is False
+
+    def test_neutral_macd_allows_bearish(self):
+        """MACD 'neutral' signal allows a SHORT entry."""
+        assert self._ctx(macd_signal="neutral").is_bearish_context is True
+
+    def test_bearish_macd_allows_bearish(self):
+        """MACD 'bearish' signal allows a SHORT entry."""
+        assert self._ctx(macd_signal="bearish").is_bearish_context is True
+
+    def test_none_macd_skips_macd_check(self):
+        """When macd_signal is None the MACD check is skipped."""
+        assert self._ctx(macd_signal=None).is_bearish_context is True
 
     def test_low_volume_rejected(self):
         assert self._ctx(volume_24h=500_000_000).is_bearish_context is False
@@ -212,6 +246,7 @@ class TestScannerPoolGetMarketContext:
             ScannerStatus("coinlore", calls_per_min=900),
             ScannerStatus("coincap", calls_per_min=450),
             ScannerStatus("coingecko", calls_per_min=25),
+            ScannerStatus("freecrypto", calls_per_min=80),
         ]
         pool._client = MagicMock()
         return pool
@@ -246,10 +281,29 @@ class TestScannerPoolGetMarketContext:
         pool._fetch_coinlore = AsyncMock(side_effect=Exception("fail"))
         pool._fetch_coincap = AsyncMock(side_effect=Exception("fail"))
         pool._fetch_coingecko = AsyncMock(side_effect=Exception("fail"))
+        pool._fetch_freecrypto = AsyncMock(side_effect=Exception("fail"))
 
         result = await pool.get_market_context("BTC")
 
         assert result is None
+
+    async def test_routes_to_freecrypto_when_primary_scanners_exhausted(self):
+        """When primary scanners are exhausted, falls back to FreeCryptoAPI."""
+        pool = self._make_pool()
+        # Exhaust the first three scanners
+        pool._scanners[0].used_this_minute = 900
+        pool._scanners[1].used_this_minute = 450
+        pool._scanners[2].used_this_minute = 25
+        expected = MarketContext(
+            price=68000.0, volume_24h=25e9, change_1h=0.3, change_24h=1.2,
+            rsi=55.0, macd_signal="bullish",
+        )
+        pool._fetch_freecrypto = AsyncMock(return_value=expected)
+
+        result = await pool.get_market_context("BTC")
+
+        assert result is expected
+        pool._fetch_freecrypto.assert_awaited_once_with("BTC")
 
     async def test_increments_used_counter(self):
         pool = self._make_pool()
@@ -265,6 +319,7 @@ class TestScannerPoolGetMarketContext:
         pool._fetch_coinlore = AsyncMock(side_effect=Exception("fail"))
         pool._fetch_coincap = AsyncMock(side_effect=Exception("fail"))
         pool._fetch_coingecko = AsyncMock(side_effect=Exception("fail"))
+        pool._fetch_freecrypto = AsyncMock(side_effect=Exception("fail"))
 
         before = time.time()
         await pool.get_market_context("BTC")
