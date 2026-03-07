@@ -1,7 +1,8 @@
 """
-Motor 1 — Futures Engine (MNQ / NQ) for Titanium Warrior v3.
+Motor 1 — Futures Engine (MES / MNQ / NQ) for Titanium Warrior v3.
 
-Trades Micro E-mini Nasdaq-100 (MNQ) and E-mini Nasdaq-100 (NQ) via IBKR.
+Trades Micro E-mini S&P 500 (MES), Micro E-mini Nasdaq-100 (MNQ),
+and E-mini Nasdaq-100 (NQ) via IBKR.
 Operates during Tokyo, London, and NY sessions (phase-dependent).
 
 Setups detected:
@@ -78,7 +79,7 @@ def _get_front_month_expiry() -> str:
 
 
 class FuturesEngine(BaseEngine):
-    """Motor 1 — MNQ / NQ futures trading engine."""
+    """Motor 1 — MES / MNQ / NQ futures trading engine."""
 
     ACTIVE_SESSIONS = ("Tokyo", "London", "NY")
 
@@ -435,8 +436,16 @@ class FuturesEngine(BaseEngine):
                 exit_price = self._get_exit_price_from_fills(ib, position)
 
                 # Calculate realised P&L
-                # MNQ multiplier = 2, NQ multiplier = 20
-                multiplier = 20 if self._reto.get_futures_instrument() == "NQ" else 2
+                # MES multiplier = 5, MNQ multiplier = 2, NQ multiplier = 20
+                instrument = self._reto.get_futures_instrument()
+                if instrument == "NQ":
+                    multiplier = 20
+                elif instrument == "MNQ":
+                    multiplier = 2
+                elif instrument == "MES":
+                    multiplier = 5
+                else:
+                    multiplier = 2  # fallback
                 if position.direction == "LONG":
                     pnl = (exit_price - position.entry_price) * position.quantity * multiplier
                 else:

@@ -37,15 +37,15 @@ class TestPhaseDetection:
         assert t.get_phase() == 1
 
     def test_phase_2_at_1500(self):
-        t = RetoTracker(initial_capital=1500.0)
+        t = RetoTracker(initial_capital=3000.0)
         assert t.get_phase() == 2
 
     def test_phase_2_at_4499(self):
-        t = RetoTracker(initial_capital=4499.0)
+        t = RetoTracker(initial_capital=4999.0)
         assert t.get_phase() == 2
 
     def test_phase_3_at_4500(self):
-        t = RetoTracker(initial_capital=4500.0)
+        t = RetoTracker(initial_capital=5000.0)
         assert t.get_phase() == 3
 
     def test_phase_4_at_9000(self):
@@ -64,20 +64,20 @@ class TestPhaseDetection:
 
 class TestPhaseTransitions:
     def test_phase_1_to_2(self, tracker):
-        """Gain $1,000 → cross Phase 2 threshold."""
-        result = TradeResult(engine="futures", pnl=1000.0)
+        """Gain $2,500 → cross Phase 2 threshold."""
+        result = TradeResult(engine="futures", pnl=2500.0)
         tracker.update_capital(result)
         assert tracker.get_phase() == 2
 
     def test_phase_2_to_3(self):
-        t = RetoTracker(initial_capital=1500.0)
-        result = TradeResult(engine="futures", pnl=3000.0)
+        t = RetoTracker(initial_capital=3000.0)
+        result = TradeResult(engine="futures", pnl=2000.0)
         t.update_capital(result)
         assert t.get_phase() == 3
 
     def test_phase_3_to_4(self):
-        t = RetoTracker(initial_capital=4500.0)
-        result = TradeResult(engine="futures", pnl=4500.0)
+        t = RetoTracker(initial_capital=5000.0)
+        result = TradeResult(engine="futures", pnl=4000.0)
         t.update_capital(result)
         assert t.get_phase() == 4
 
@@ -97,25 +97,25 @@ class TestPositionSizing:
         assert tracker.get_contracts("futures") == 1
 
     def test_phase_1_futures_instrument(self, tracker):
-        assert tracker.get_futures_instrument() == "MNQ"
+        assert tracker.get_futures_instrument() == "MES"
 
     def test_phase_2_futures_contracts(self):
-        t = RetoTracker(initial_capital=1500.0)
-        assert t.get_contracts("futures") == 3
+        t = RetoTracker(initial_capital=3000.0)
+        assert t.get_contracts("futures") == 2
 
     def test_phase_3_futures_instrument(self):
-        t = RetoTracker(initial_capital=4500.0)
-        assert t.get_futures_instrument() == "NQ"
+        t = RetoTracker(initial_capital=5000.0)
+        assert t.get_futures_instrument() == "MNQ"
 
     def test_phase_4_contracts(self):
         t = RetoTracker(initial_capital=9000.0)
-        assert t.get_contracts("futures") == 2
+        assert t.get_contracts("futures") == 1
 
     def test_phase_1_momo_max(self, tracker):
         assert tracker.get_position_size("momo") == 100.0
 
     def test_phase_2_momo_max(self):
-        t = RetoTracker(initial_capital=1500.0)
+        t = RetoTracker(initial_capital=3000.0)
         assert t.get_position_size("momo") == 250.0
 
     def test_phase_1_options_max(self, tracker):
@@ -143,9 +143,9 @@ class TestDrawdownProtection:
         assert t._drawdown_override is True
 
     def test_drawdown_override_uses_previous_phase(self):
-        t = RetoTracker(initial_capital=1600.0)  # Phase 2
-        t._today_start_capital = 1600.0
-        result = TradeResult(engine="futures", pnl=-150.0)  # ~9.4% loss
+        t = RetoTracker(initial_capital=3100.0)  # Phase 2
+        t._today_start_capital = 3100.0
+        result = TradeResult(engine="futures", pnl=-300.0)  # ~9.7% loss
         t.update_capital(result)
         # Should operate at Phase 1 sizing when override active
         assert t._effective_phase() == 1
