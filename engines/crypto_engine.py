@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -28,6 +29,7 @@ from analysis.patterns import detect_ema_pullback, detect_vwap_bounce
 from analysis.technical import calculate_atr, calculate_ema, calculate_vwap
 from config import settings
 from core.reto_tracker import TradeResult as RetoTradeResult
+from core.scanner_pool import ScannerPool
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
 if TYPE_CHECKING:
@@ -61,6 +63,9 @@ CRYPTO_TICK_SIZE = {
 
 # How long (seconds) to hold a position before closing at market if TP/SL not yet hit
 CRYPTO_MAX_POSITION_AGE_SECS = 30 * 60  # 30 minutes
+
+# Minimum time (seconds) between entry attempts for the same symbol
+ENTRY_COOLDOWN_SECONDS = 300  # 5 minutes
 
 
 def _round_to_tick(price: float, symbol: str) -> float:
@@ -108,6 +113,12 @@ class CryptoEngine(BaseEngine):
         self._pending_tickers: set[str] = set()
         # Tracks the active software-managed position (TP/SL monitored in-process)
         self._active_position: CryptoPosition | None = None
+
+        # Cooldown: tracks the last entry attempt time per symbol
+        self._last_attempt_time: dict[str, float] = {}
+
+        # External market-context confirmation (ScannerPool)
+        self._scanner: ScannerPool = ScannerPool()
 
         # Startup warmup: skip scanning for the first 120 seconds to allow IBKR
         # data feeds to stabilise and any existing positions to be detected.
@@ -321,23 +332,39 @@ class CryptoEngine(BaseEngine):
             logger.warning("[crypto] Correlation conflict with futures; skipping %s %s.", direction, signal.ticker)
             return None
 
+        # Cooldown: prevent duplicate entry attempts within 5 minutes
+        now = time.time()
+        last_attempt = self._last_attempt_time.get(signal.ticker, 0)
+        if now - last_attempt < ENTRY_COOLDOWN_SECONDS:
+            remaining = ENTRY_COOLDOWN_SECONDS - (now - last_attempt)
+            logger.debug(
+                "[crypto] Cooldown active for %s — %.0fs remaining",
+                signal.ticker, remaining,
+            )
+            return None
+        self._last_attempt_time[signal.ticker] = now
+
         # Dynamic allocation based on time of day
         allocation = self._get_effective_allocation()
         max_dollars = self._reto.capital * allocation * size_multiplier
-        sl_pct = 0.015  # 1.5 %
-        tp_pct = 0.035  # 3.5 %
-        # Round entry, tp, sl to valid IBKR Paxos tick increments
+
+        # ATR-based SL/TP (1.5× ATR for SL, 3× ATR for TP — 1:2 R:R)
+        atr = setup.atr
+        if atr <= 0:
+            atr = signal.entry_price * 0.002  # fallback: 0.2% of price
+
+        # Round entry to valid tick increment
         entry = _round_to_tick(signal.entry_price, signal.ticker)
-        sl = (
-            _round_to_tick(entry * (1 - sl_pct), signal.ticker)
-            if direction == "LONG"
-            else _round_to_tick(entry * (1 + sl_pct), signal.ticker)
-        )
-        tp = (
-            _round_to_tick(entry * (1 + tp_pct), signal.ticker)
-            if direction == "LONG"
-            else _round_to_tick(entry * (1 - tp_pct), signal.ticker)
-        )
+
+        sl_distance = atr * 1.5
+        tp_distance = atr * 3.0
+
+        if direction == "LONG":
+            sl = _round_to_tick(entry - sl_distance, signal.ticker)
+            tp = _round_to_tick(entry + tp_distance, signal.ticker)
+        else:
+            sl = _round_to_tick(entry + sl_distance, signal.ticker)
+            tp = _round_to_tick(entry - tp_distance, signal.ticker)
         qty = round(max_dollars / entry, 6)  # BTC/ETH fractional
 
         logger.info(
@@ -366,6 +393,30 @@ class CryptoEngine(BaseEngine):
         contract = self._get_contract(signal.ticker)
         if contract is None:
             return None
+
+        # External scanner confirmation — validate market context before placing order
+        context = await self._scanner.get_market_context(signal.ticker)
+        if context is not None:
+            if direction == "LONG" and not context.is_bullish_context:
+                logger.info(
+                    "[crypto] Scanner says SKIP LONG %s: 1h=%.1f%% 24h=%.1f%% vol=$%.0fB",
+                    signal.ticker, context.change_1h, context.change_24h,
+                    context.volume_24h / 1e9,
+                )
+                return None
+            if direction == "SHORT" and not context.is_bearish_context:
+                logger.info(
+                    "[crypto] Scanner says SKIP SHORT %s: 1h=%.1f%% 24h=%.1f%%",
+                    signal.ticker, context.change_1h, context.change_24h,
+                )
+                return None
+            logger.info(
+                "[crypto] Scanner CONFIRMS %s %s: 1h=%.1f%% 24h=%.1f%% vol=$%.0fB",
+                direction, signal.ticker, context.change_1h, context.change_24h,
+                context.volume_24h / 1e9,
+            )
+        else:
+            logger.warning("[crypto] No scanner data — proceeding with IBKR signals only")
 
         action = "BUY" if direction == "LONG" else "SELL"
         try:
@@ -401,8 +452,13 @@ class CryptoEngine(BaseEngine):
                 )
                 return None
 
-            # Price the IOC limit at current market to ensure immediate fill
-            ioc_limit = _round_to_tick(current_price, signal.ticker)
+            # Price the IOC limit 2 ticks above ask (BUY) or below bid (SELL) to
+            # guarantee fill while staying close to the current market.
+            tick = CRYPTO_TICK_SIZE.get(signal.ticker, 0.01)
+            if action == "BUY":
+                ioc_limit = _round_to_tick(current_price + tick * 2, signal.ticker)
+            else:
+                ioc_limit = _round_to_tick(current_price - tick * 2, signal.ticker)
 
             entry_order = LimitOrder(
                 action=action,
