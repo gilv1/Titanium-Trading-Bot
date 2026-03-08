@@ -35,6 +35,7 @@ from analysis.patterns import (
 )
 from analysis.technical import calculate_atr, calculate_ema, calculate_rsi, calculate_vwap
 from config import settings
+from core.news_sentinel import MarketContext, NewsSentinel
 from core.reto_tracker import TradeResult as RetoTradeResult
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
@@ -91,6 +92,7 @@ class FuturesEngine(BaseEngine):
         risk_manager: "RiskManager",
         telegram: "TelegramNotifier | None" = None,
         journal: "Any | None" = None,
+        news_sentinel: "NewsSentinel | None" = None,
     ) -> None:
         super().__init__(
             connection_manager=connection_manager,
@@ -106,6 +108,8 @@ class FuturesEngine(BaseEngine):
         # Guard against duplicate bracket orders within the same loop cycle
         self._order_pending: bool = False
         self._entry_trade: Any = None  # tracked to detect async cancellations
+        self._news_sentinel: NewsSentinel = news_sentinel if news_sentinel is not None else NewsSentinel()
+        self._last_market_context: MarketContext | None = None
 
     def get_engine_name(self) -> str:
         return "futures"
@@ -161,6 +165,29 @@ class FuturesEngine(BaseEngine):
                 if start_minutes <= current_minutes < end_minutes:
                     return sess_name
         return "NY"
+
+    # ──────────────────────────────────────────────────────────
+    # News Sentinel integration
+    # ──────────────────────────────────────────────────────────
+
+    async def _build_market_context(self) -> str:
+        """
+        Build a market context string for the AI evaluator.
+
+        Fetches the latest MarketContext from the News Sentinel and formats
+        it into a concise string for inclusion in the LLM prompt.
+        """
+        ctx = await self._news_sentinel.get_market_context(self._connection)
+        self._last_market_context = ctx
+        upcoming_names = ", ".join(e["name"] for e in ctx.upcoming_events[:3]) or "None"
+        return (
+            f"VIX: {ctx.vix_level:.1f} ({ctx.vix_regime})\n"
+            f"Risk Level: {ctx.risk_level}\n"
+            f"Upcoming Events (24h): {upcoming_names}\n"
+            f"Minutes to next high-impact event: {ctx.minutes_to_next_event}\n"
+            f"Size modifier: {ctx.size_modifier:.0%}\n"
+            f"Reasoning: {ctx.reasoning}"
+        )
 
     # ──────────────────────────────────────────────────────────
     # Market data helpers
@@ -271,6 +298,37 @@ class FuturesEngine(BaseEngine):
         if self._order_pending:
             logger.warning("[futures] Order already pending — skipping duplicate bracket order.")
             return None
+
+        # ── News Sentinel check ───────────────────────────────────
+        # Use cached context if available (set by _build_market_context in run_loop),
+        # otherwise fetch fresh context.
+        if self._last_market_context is not None:
+            context = self._last_market_context
+        else:
+            context = await self._news_sentinel.get_market_context(self._connection)
+            self._last_market_context = context
+
+        if context.should_pause:
+            logger.info("[futures] Trading PAUSED by News Sentinel: %s", context.reasoning)
+            if self._telegram:
+                asyncio.create_task(
+                    self._telegram._send(
+                        f"⚠️ <b>Trading PAUSED</b>\n"
+                        f"Reason: {context.reasoning}\n"
+                        f"VIX: {context.vix_level:.1f}\n"
+                        f"Will resume when conditions improve."
+                    )
+                )
+            return None
+
+        # Apply News Sentinel size modifier
+        if context.size_modifier < 1.0:
+            logger.info(
+                "[futures] News Sentinel reducing size to %.0f%%: %s",
+                context.size_modifier * 100,
+                context.reasoning,
+            )
+        size_multiplier *= context.size_modifier
 
         try:
             from ib_insync import LimitOrder, Order, StopOrder  # type: ignore

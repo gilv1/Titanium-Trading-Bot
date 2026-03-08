@@ -265,6 +265,7 @@ class BaseEngine(ABC):
                         if daily_pnl is not None
                         else 0.0
                     )
+                    market_context_str = await self._build_market_context()
                     ai_eval = await self._ai_evaluator.evaluate_trade(
                         setup_type=setup.signal.setup_type,
                         engine=self.get_engine_name(),
@@ -285,6 +286,7 @@ class BaseEngine(ABC):
                             else setup.signal.ticker
                         ),
                         open_positions=self._risk.get_open_position_count(),
+                        market_context=market_context_str,
                     )
                     if not ai_eval.approved:
                         logger.info(
@@ -360,6 +362,19 @@ class BaseEngine(ABC):
                 logger.error("[%s] Unhandled error in run_loop: %s", self.get_engine_name(), exc, exc_info=True)
 
             await asyncio.sleep(self._loop_interval)
+
+    # ──────────────────────────────────────────────────────────
+    # Market context hook (overridden by engines with news sentinel)
+    # ──────────────────────────────────────────────────────────
+
+    async def _build_market_context(self) -> str:
+        """
+        Return a formatted market context string for the AI evaluator.
+
+        Default returns empty string (no macro context).
+        Engines that have a News Sentinel (e.g. FuturesEngine) override this.
+        """
+        return ""
 
     # ──────────────────────────────────────────────────────────
     # Abstract interface

@@ -88,6 +88,7 @@ def build_engines(
     risk: Any,
     telegram: Any,
     journal: Any = None,
+    news_sentinel: Any = None,
 ) -> list[Any]:
     """Instantiate enabled engines and return them as a list."""
     from config import settings
@@ -96,7 +97,7 @@ def build_engines(
 
     if settings.ENABLE_FUTURES:
         from engines.futures_engine import FuturesEngine
-        engines.append(FuturesEngine(connection, brain, reto, risk, telegram, journal=journal))
+        engines.append(FuturesEngine(connection, brain, reto, risk, telegram, journal=journal, news_sentinel=news_sentinel))
         logger.info("🔵 Futures engine ENABLED")
     else:
         logger.info("🔵 Futures engine disabled")
@@ -193,6 +194,8 @@ async def run_bot(trading_mode: str) -> None:
     risk = RiskManager(reto_tracker=reto)
     telegram = TelegramNotifier()
     journal = TradeJournal()
+    from core.news_sentinel import NewsSentinel
+    news_sentinel = NewsSentinel()
 
     logger.info(
         "Startup — Phase %d | Capital $%.2f | Instrument %s",
@@ -210,7 +213,7 @@ async def run_bot(trading_mode: str) -> None:
         logger.warning("Cash account not connected — options/momo engines will be inactive.")
 
     # ── 4. Engines ───────────────────────────────────────────
-    engines = build_engines(connection, brain, reto, risk, telegram, journal=journal)
+    engines = build_engines(connection, brain, reto, risk, telegram, journal=journal, news_sentinel=news_sentinel)
     if not engines:
         logger.warning("No engines enabled. Check your .env settings.")
         return
