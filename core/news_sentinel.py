@@ -363,6 +363,19 @@ class NewsSentinel:
     # Public API
     # ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _load_event_patterns() -> "dict[str, Any]":
+        """
+        Load historical event impact patterns from ``data/event_patterns.json``.
+
+        Returns an empty dict if the file does not exist (graceful degradation).
+        """
+        try:
+            from core.event_analyzer import EventAnalyzer
+            return EventAnalyzer.load_patterns()
+        except Exception:  # noqa: BLE001
+            return {}
+
     async def get_market_context(
         self,
         connection_manager: "ConnectionManager | None" = None,
@@ -390,6 +403,19 @@ class NewsSentinel:
                 event_impact=event_impact,
                 vix=vix,
             )
+
+            # Enrich with historical event pattern context (if available)
+            if nearest_event is not None:
+                event_patterns = self._load_event_patterns()
+                event_name = nearest_event.get("name", "")
+                if event_name in event_patterns:
+                    pattern = event_patterns[event_name]
+                    historical_context = (
+                        f" | Historical: avg {pattern['avg_move_15min_pts']:.0f}pts move, "
+                        f"{pattern['reversal_pct']:.0f}% reversal rate, "
+                        f"best entry {pattern['best_entry_delay_min']}min after"
+                    )
+                    reasons.append(historical_context)
 
             # Collect upcoming events in the next 24 hours (positive minutes_away only)
             upcoming = [e for e in events if 0 <= e["minutes_away"] <= 1440]

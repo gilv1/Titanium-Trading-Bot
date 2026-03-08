@@ -393,3 +393,36 @@ def detect_engulfing(candle: pd.Series, prev_candle: pd.Series) -> bool:
     prev_body_hi = max(prev_open, prev_close)
 
     return cur_body_lo < prev_body_lo and cur_body_hi > prev_body_hi
+
+
+# ──────────────────────────────────────────────────────────────
+# Higher-Timeframe Trend Confirmation
+# ──────────────────────────────────────────────────────────────
+
+
+def check_higher_timeframe_trend(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Check if the 5-minute resampled trend agrees with the proposed trade direction.
+
+    Uses the last 50 bars, groups them into 5-bar (5-min equivalent) chunks,
+    and checks whether EMA9 > EMA21 (LONG) or EMA9 < EMA21 (SHORT) on that
+    higher-timeframe view.
+
+    Returns True if the higher-timeframe trend is aligned (or there is
+    insufficient data to make a determination).
+    """
+    if len(df) < 30:
+        return True
+
+    recent = df.tail(50).copy().reset_index(drop=True)
+    groups = recent.groupby(recent.index // 5).agg({"close": "last"})
+
+    if len(groups) < 5:
+        return True
+
+    ema9 = groups["close"].ewm(span=9, adjust=False).mean()
+    ema21 = groups["close"].ewm(span=21, adjust=False).mean()
+
+    if direction == "LONG":
+        return float(ema9.iloc[-1]) > float(ema21.iloc[-1])
+    return float(ema9.iloc[-1]) < float(ema21.iloc[-1])
