@@ -49,6 +49,111 @@ _PROFIT_LOCK_TIERS: list[tuple[float, float, int, float]] = [
 ]
 
 
+class DynamicTrailingLock:
+    """
+    Tracks peak daily P&L and stops trading if P&L drops 30% from the peak.
+
+    NO CAP on gains — only protects when losing from peak.
+
+    Examples:
+        Peak = +$268, P&L drops to +$190 (lost $78 = 29% of peak) → continue
+        Peak = +$268, P&L drops to +$117 (lost $151 = 56% of peak) → STOP
+
+        P&L goes +$100 → +$200 → +$300 → +$400 → +$500 → NEVER stops
+        P&L drops from $500 to $350 (lost 30%) → STOP at +$350
+    """
+
+    TRAILING_DROP_PCT: float = 0.30   # Stop if P&L drops 30% from peak
+    MIN_PEAK_TO_ACTIVATE: float = 25.0  # Don't activate until at least +$25
+
+    def __init__(self) -> None:
+        self._peak_pnl: float = 0.0
+        self._locked: bool = False
+        self._lock_amount: float = 0.0
+
+    def update(self, current_pnl: float) -> bool:
+        """
+        Update with current P&L.  Returns True if trading should STOP.
+
+        The lock is permanent for the remainder of the day once triggered.
+        """
+        if self._locked:
+            return True
+
+        # Peak only ever increases
+        if current_pnl > self._peak_pnl:
+            self._peak_pnl = current_pnl
+
+        # Don't activate until minimum peak reached
+        if self._peak_pnl < self.MIN_PEAK_TO_ACTIVATE:
+            return False
+
+        # Check if P&L dropped 30% from peak
+        drop_from_peak = self._peak_pnl - current_pnl
+        drop_pct = drop_from_peak / self._peak_pnl if self._peak_pnl > 0 else 0.0
+
+        if drop_pct >= self.TRAILING_DROP_PCT:
+            self._locked = True
+            self._lock_amount = current_pnl
+            logger.warning(
+                "[DynamicTrailingLock] PROFIT LOCKED — P&L dropped %.0f%% from peak. "
+                "Protected: $%.2f (peak was $%.2f).",
+                drop_pct * 100,
+                self._lock_amount,
+                self._peak_pnl,
+            )
+            return True
+
+        return False
+
+    def reset(self) -> None:
+        """Reset at the start of a new trading day."""
+        self._peak_pnl = 0.0
+        self._locked = False
+        self._lock_amount = 0.0
+
+    def get_trade_restrictions(self, current_pnl: float, capital: float) -> dict:
+        """
+        Return trading restrictions based on current P&L level.
+
+        NEVER stops trading — only adjusts minimum brain score and position size.
+        These restrictions layer on top of the existing profit-tier system.
+        """
+        pnl_pct = (current_pnl / capital) * 100 if capital > 0 else 0.0
+
+        if pnl_pct >= 50:
+            return {
+                "min_score": 85,
+                "size_mult": 0.50,
+                "reason": f"+{pnl_pct:.0f}% — elite trades only, 50% size",
+            }
+        if pnl_pct >= 30:
+            return {
+                "min_score": 80,
+                "size_mult": 0.75,
+                "reason": f"+{pnl_pct:.0f}% — high quality only, 75% size",
+            }
+        if pnl_pct >= 20:
+            return {
+                "min_score": 75,
+                "size_mult": 1.0,
+                "reason": f"+{pnl_pct:.0f}% — good trades only",
+            }
+        return {"min_score": 65, "size_mult": 1.0, "reason": "Normal trading"}
+
+    @property
+    def is_locked(self) -> bool:
+        return self._locked
+
+    @property
+    def peak_pnl(self) -> float:
+        return self._peak_pnl
+
+    @property
+    def locked_amount(self) -> float:
+        return self._lock_amount
+
+
 @dataclass
 class TradeRecord:
     """Minimal record for risk-tracking purposes."""

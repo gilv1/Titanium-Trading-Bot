@@ -97,7 +97,7 @@ class TestPositionSizing:
         assert tracker.get_contracts("futures") == 1
 
     def test_phase_1_futures_instrument(self, tracker):
-        assert tracker.get_futures_instrument() == "MES"
+        assert tracker.get_futures_instrument() == "MNQ"
 
     def test_phase_2_futures_contracts(self):
         t = RetoTracker(initial_capital=3000.0)
