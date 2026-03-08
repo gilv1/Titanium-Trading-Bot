@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.risk_manager import RiskManager, _PROFIT_LOCK_TIERS, _business_days_ago
+from core.risk_manager import DynamicTrailingLock, RiskManager, _PROFIT_LOCK_TIERS, _business_days_ago
 
 
 # ──────────────────────────────────────────────────────────────
@@ -712,3 +712,185 @@ class TestKillSwitchPersistence:
                 assert risk._kill_switch_active is False
 
 
+
+# ──────────────────────────────────────────────────────────────
+# DynamicTrailingLock — standalone 30%-drop rule
+# ──────────────────────────────────────────────────────────────
+
+
+class TestDynamicTrailingLock:
+    """Tests for the standalone DynamicTrailingLock class (30% drop-from-peak rule)."""
+
+    def test_not_locked_at_start(self):
+        lock = DynamicTrailingLock()
+        assert lock.is_locked is False
+        assert lock.peak_pnl == 0.0
+        assert lock.locked_amount == 0.0
+
+    def test_no_lock_below_min_peak(self):
+        """Lock must NOT activate when peak is below MIN_PEAK_TO_ACTIVATE ($25)."""
+        lock = DynamicTrailingLock()
+        # Peak only $20 — drop of any size must not lock
+        lock.update(20.0)
+        assert lock.update(0.0) is False
+        assert lock.is_locked is False
+
+    def test_peak_only_rises(self):
+        """Peak should increase on new highs but never decrease."""
+        lock = DynamicTrailingLock()
+        lock.update(100.0)
+        assert lock.peak_pnl == 100.0
+        # Drop by less than 30% so the lock does NOT trigger
+        lock.update(80.0)   # 20% drop — below threshold
+        assert lock.peak_pnl == 100.0  # did not decrease
+        assert lock.is_locked is False
+        lock.update(200.0)
+        assert lock.peak_pnl == 200.0  # updated to new high
+
+    def test_continues_below_30pct_drop(self):
+        """A 29% drop from peak must NOT trigger the lock (< 30% threshold)."""
+        lock = DynamicTrailingLock()
+        lock.update(268.0)   # peak = $268
+        # Drop = $78 = 29.1% of $268 — just below the 30% threshold
+        result = lock.update(190.0)
+        assert result is False
+        assert lock.is_locked is False
+
+    def test_locks_at_30pct_drop(self):
+        """A 30% drop from peak must trigger the lock (>= 30% threshold)."""
+        lock = DynamicTrailingLock()
+        lock.update(100.0)   # peak = $100; threshold = $70
+        result = lock.update(70.0)  # exact 30% drop
+        assert result is True
+        assert lock.is_locked is True
+        assert lock.locked_amount == 70.0
+
+    def test_locks_above_30pct_drop(self):
+        """A 56% drop (from user's actual data) must trigger the lock."""
+        lock = DynamicTrailingLock()
+        lock.update(268.0)   # peak = $268
+        lock.update(190.0)   # 29% drop — OK
+        # Drop = $151 (56.3% of peak $268) → LOCK
+        result = lock.update(117.0)
+        assert result is True
+        assert lock.is_locked is True
+        assert lock.locked_amount == 117.0
+        assert lock.peak_pnl == 268.0
+
+    def test_lock_is_permanent_for_the_day(self):
+        """Once locked, update() must always return True even if P&L recovers."""
+        lock = DynamicTrailingLock()
+        lock.update(100.0)
+        lock.update(70.0)  # triggers lock
+        assert lock.is_locked is True
+        # Simulated P&L recovery
+        assert lock.update(300.0) is True
+        assert lock.is_locked is True
+
+    def test_no_cap_on_gains(self):
+        """Continuous gains must NEVER trigger the lock."""
+        lock = DynamicTrailingLock()
+        for pnl in [50, 100, 200, 300, 400, 500, 1000]:
+            assert lock.update(float(pnl)) is False
+        assert lock.is_locked is False
+        assert lock.peak_pnl == 1000.0
+
+    def test_reset_clears_all_state(self):
+        """reset() must completely clear peak, lock, and locked_amount."""
+        lock = DynamicTrailingLock()
+        lock.update(268.0)
+        lock.update(117.0)  # triggers lock
+        assert lock.is_locked is True
+
+        lock.reset()
+        assert lock.is_locked is False
+        assert lock.peak_pnl == 0.0
+        assert lock.locked_amount == 0.0
+        # After reset, pnl updates are accepted again
+        assert lock.update(50.0) is False
+
+    def test_get_trade_restrictions_normal(self):
+        """Below 20% P&L: normal trading restrictions."""
+        lock = DynamicTrailingLock()
+        r = lock.get_trade_restrictions(current_pnl=80.0, capital=500.0)  # 16%
+        assert r["min_score"] == 65
+        assert r["size_mult"] == 1.0
+
+    def test_get_trade_restrictions_at_20pct(self):
+        """At 20%+ P&L: require score 75, full size."""
+        lock = DynamicTrailingLock()
+        r = lock.get_trade_restrictions(current_pnl=100.0, capital=500.0)  # 20%
+        assert r["min_score"] == 75
+        assert r["size_mult"] == 1.0
+
+    def test_get_trade_restrictions_at_30pct(self):
+        """At 30%+ P&L: require score 80, 75% size."""
+        lock = DynamicTrailingLock()
+        r = lock.get_trade_restrictions(current_pnl=150.0, capital=500.0)  # 30%
+        assert r["min_score"] == 80
+        assert r["size_mult"] == 0.75
+
+    def test_get_trade_restrictions_at_50pct(self):
+        """At 50%+ P&L: require score 85, 50% size (elite trades only)."""
+        lock = DynamicTrailingLock()
+        r = lock.get_trade_restrictions(current_pnl=250.0, capital=500.0)  # 50%
+        assert r["min_score"] == 85
+        assert r["size_mult"] == 0.50
+
+    def test_user_example_from_problem_statement(self):
+        """Reproduce the live trading example exactly as described in the problem statement.
+
+        Peak +$268 at 12:37 PM.
+        - 12:40: +$190 → drop 29% → should CONTINUE (< 30%)
+        - 12:45: +$117 → drop 56% → should STOP (> 30%)
+        """
+        lock = DynamicTrailingLock()
+
+        # Morning gains, no cap
+        for pnl in [50.26, 58.02, 96.78, 141.04, 179.80, 218.56, 268.32]:
+            assert lock.update(pnl) is False, f"Should continue at +${pnl}"
+
+        assert lock.peak_pnl == pytest.approx(268.32)
+
+        # 12:40 — 29% drop — should continue
+        assert lock.update(190.0) is False
+
+        # 12:45 — 56% drop — should stop
+        assert lock.update(117.0) is True
+        assert lock.is_locked is True
+        assert lock.locked_amount == 117.0
+
+
+# ──────────────────────────────────────────────────────────────
+# Settings — new MNQ / MoMo configuration values
+# ──────────────────────────────────────────────────────────────
+
+
+class TestNewSettings:
+    """Verify the new settings added for MNQ and MoMo integration."""
+
+    def test_futures_ticker_defaults_to_mnq(self):
+        from config import settings
+        assert settings.FUTURES_TICKER == "MNQ"
+
+    def test_futures_multiplier_defaults_to_2(self):
+        from config import settings
+        assert settings.FUTURES_MULTIPLIER == 2
+
+    def test_enable_momo_defaults_to_true(self):
+        from config import settings
+        assert settings.ENABLE_MOMO is True
+
+    def test_momo_allocation_is_set(self):
+        from config import settings
+        assert settings.MOMO_ALLOCATION > 0
+
+    def test_phase1_uses_mnq(self):
+        """Phase 1 should use MNQ as the futures instrument."""
+        from config import settings
+        assert settings.PHASES[1].futures_instrument == "MNQ"
+
+    def test_phase4_uses_nq(self):
+        """Phase 4 should upgrade to full NQ."""
+        from config import settings
+        assert settings.PHASES[4].futures_instrument == "NQ"
