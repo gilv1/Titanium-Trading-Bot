@@ -26,6 +26,8 @@ from analysis.patterns import detect_breakout, detect_ema_pullback, detect_vwap_
 from analysis.scanner import MomoScanner
 from analysis.technical import calculate_ema, calculate_vwap
 from config import settings
+from core.news_correlator import NewsCorrelator, NO_PATTERN_CONTEXT
+from core.sympathy_detector import SympathyDetector
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
 if TYPE_CHECKING:
@@ -87,6 +89,14 @@ class MomoEngine(BaseEngine):
         self._partial_exits: set[str] = set()
         # Highest price seen per ticker for trailing stop calculation
         self._highest_price: dict[str, float] = {}
+        # News-price correlation engine and sympathy play detector
+        self._news_correlator = NewsCorrelator()
+        self._sympathy_detector = SympathyDetector()
+        logger.info(
+            "[momo] Loaded %d news patterns and %d sympathy groups.",
+            len(self._news_correlator.patterns),
+            len(self._sympathy_detector.groups),
+        )
 
     def get_engine_name(self) -> str:
         return "momo"
@@ -275,6 +285,24 @@ class MomoEngine(BaseEngine):
             if size_mult == 0.0:
                 continue
 
+            # Classify news catalyst for this candidate
+            catalyst = self._news_correlator.classify_ticker_news(
+                candidate.ticker,
+                gap_pct=getattr(candidate, "gap_pct", 0.0),
+            )
+            news_context = self._news_correlator.get_context_for_ticker(
+                candidate.ticker, catalyst_type=catalyst
+            )
+
+            # Log sympathy plays so the team can watch related tickers
+            sympathy = self._sympathy_detector.get_sympathy_tickers(candidate.ticker)
+            if sympathy:
+                logger.info(
+                    "[momo] %s sympathy tickers: %s",
+                    candidate.ticker,
+                    ", ".join(sympathy[:6]),
+                )
+
             # Fetch intraday 1-min bars
             df = await self._fetch_intraday_bars(candidate.ticker)
             if df.empty or len(df) < 15:
@@ -282,6 +310,9 @@ class MomoEngine(BaseEngine):
                 entry = candidate.price
                 sl = round(entry * _FALLBACK_SL_PCT, 2)
                 tp = round(entry * _FALLBACK_TP_PCT, 2)
+                reasoning = f"MoMo fallback: {candidate.news_headline}"
+                if news_context != NO_PATTERN_CONTEXT:
+                    reasoning += f" | {news_context}"
                 sig = Signal(
                     direction="LONG",
                     confidence=candidate.score,
@@ -289,7 +320,7 @@ class MomoEngine(BaseEngine):
                     stop_price=sl,
                     target_price=tp,
                     setup_type="VWAP_BOUNCE",
-                    reasoning=f"MoMo fallback: {candidate.news_headline}",
+                    reasoning=reasoning,
                     ticker=candidate.ticker,
                 )
                 setups.append(Setup(signal=sig, engine="momo", session="NY", atr=0.0))
@@ -332,6 +363,10 @@ class MomoEngine(BaseEngine):
                     else round(price * _FALLBACK_SL_PCT, 2)
                 )
                 vwap_sig.target_price = self._calculate_target_price(price, hod)
+                if news_context != NO_PATTERN_CONTEXT:
+                    vwap_sig.reasoning = (
+                        (vwap_sig.reasoning or "") + f" | {news_context}"
+                    ).lstrip(" | ")
                 sig = vwap_sig
 
             # --- Entry type 2: EMA 9 Pullback / Dip Buy ---

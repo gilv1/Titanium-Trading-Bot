@@ -3,7 +3,10 @@ __pycache__/
 *.pyc
 data/brain_memory.json
 data/risk_state.json
+data/momo_news_patterns.json
+data/sympathy_correlations.json
 data/backups/*.json
+data/historical/momo/*.csv
 !data/.gitkeep
 !data/backups/.gitkeep
 journal/*.csv
