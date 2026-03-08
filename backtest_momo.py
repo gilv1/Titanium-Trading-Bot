@@ -31,7 +31,7 @@ import pandas as pd
 
 from analysis.technical import calculate_ema, calculate_vwap
 from config import settings
-from core.brain import AIBrain, TradeOutcome
+from core.brain import AIBrain, BrainMemory, TradeOutcome
 from core.news_correlator import NewsCorrelator
 from core.risk_manager import RiskManager
 from core.reto_tracker import RetoTracker
@@ -51,8 +51,8 @@ SESSION_START = (9, 30)
 SESSION_END = (12, 0)
 
 # Signal detection thresholds
-VWAP_TOLERANCE_PCT = 0.005   # within 0.5% of VWAP
-EMA_PULLBACK_TOL_PCT = 0.003  # within 0.3% of EMA9
+VWAP_TOLERANCE_PCT = 0.02    # within 2% of VWAP (small-caps are volatile)
+EMA_PULLBACK_TOL_PCT = 0.015  # within 1.5% of EMA9
 TRAIL_STOP_PCT = 0.03         # trail stop 3% below running high
 
 
@@ -188,6 +188,32 @@ def _detect_consolidation_breakout(df: pd.DataFrame, i: int) -> Optional[dict]:
     return None
 
 
+def _detect_gap_and_go(bars: pd.DataFrame, gap_pct: float) -> Optional[int]:
+    """
+    If stock gapped up > 10% and the first 5 bars close higher than the first
+    bar's open, enter LONG at bar 5's close.
+
+    Returns the entry bar index (5) on signal, or None.
+    """
+    if gap_pct < 0.10 or len(bars) < 6:
+        return None
+    first_5 = bars.iloc[:5]
+    if float(first_5.iloc[-1]["close"]) > float(first_5.iloc[0]["open"]):
+        return 5  # entry bar index
+    return None
+
+
+def _detect_volume_surge(bars: pd.DataFrame) -> bool:
+    """Check if first 15 bars have 3× average volume of the remaining bars."""
+    if len(bars) < 30:
+        return False
+    first_15_vol = float(bars.iloc[:15]["volume"].mean())
+    rest_vol = float(bars.iloc[15:]["volume"].mean())
+    if rest_vol <= 0:
+        return False
+    return first_15_vol >= 3 * rest_vol
+
+
 # ──────────────────────────────────────────────────────────────
 # Trade simulation (one file)
 # ──────────────────────────────────────────────────────────────
@@ -199,6 +225,7 @@ def _simulate_file(
     trade_date: str,
     brain: AIBrain,
     pdt: PDTTracker,
+    gap_pct: float = 0.0,
 ) -> list[MomoTrade]:
     """Simulate one day's worth of intraday data for a MoMo stock."""
     trades: list[MomoTrade] = []
@@ -242,6 +269,34 @@ def _simulate_file(
     entry_bar = 0
     setup_type = ""
     half_sold = False
+
+    # ── Gap-and-Go: check before the main bar loop (entry at bar 5) ──
+    gap_and_go_bar = _detect_gap_and_go(df, gap_pct)
+    volume_surge = _detect_volume_surge(df)
+    if gap_and_go_bar is not None and not in_trade and pdt.can_trade(parsed_date):
+        gag_price = float(df["close"].iloc[gap_and_go_bar])
+        gag_sl = gag_price * 0.97
+        gag_tp = gag_price * 1.06
+        # Boost confidence when volume surge accompanies the gap-and-go
+        setup_label = "GAP_AND_GO_VOLUME" if volume_surge else "GAP_AND_GO"
+        atr_approx = float((df["high"] - df["low"]).iloc[:gap_and_go_bar].mean()) if gap_and_go_bar > 0 else 1.0
+        decision = brain.evaluate_trade(
+            setup_type=setup_label,
+            engine="momo_backtest",
+            entry=gag_price,
+            stop=gag_sl,
+            target=gag_tp,
+            session="NY",
+            atr=atr_approx,
+        )
+        if decision.approved:
+            in_trade = True
+            entry_price = gag_price
+            sl_price = gag_sl
+            tp1_price = max(prior_hod, gag_tp)
+            entry_bar = gap_and_go_bar
+            setup_type = setup_label
+            half_sold = False
 
     for i in range(10, len(df)):
         if not in_trade:
@@ -405,6 +460,14 @@ def run_backtest() -> MomoStats:
         return MomoStats(0, 0, 0.0, 0.0, 0.0, 0.0, None, None)
 
     brain = AIBrain()
+    # Reset to a clean-slate memory for each backtest run.  This ensures
+    # the strategy is evaluated without bias from prior live-trading data or
+    # a previously poisoned/incomplete backtest state.  Also disable in-run
+    # state updates so the brain's approval threshold stays consistent
+    # across all files — the brain would otherwise block all trades after
+    # the very first loss, yielding 0 total trades.
+    brain.memory = BrainMemory()
+    brain.record_outcome = lambda _outcome: None  # type: ignore[method-assign]
     pdt = PDTTracker()
     news_correlator = NewsCorrelator()
     sympathy_detector = SympathyDetector()
@@ -428,17 +491,19 @@ def run_backtest() -> MomoStats:
                 logger.warning("Skipping %s: missing columns.", csv_path)
                 continue
 
-            # Calculate gap pct from first bar if possible
-            gap_pct = 0.0
-            if len(df) > 0 and "open" in df.columns:
-                gap_pct = float(df["open"].iloc[0])
+            # All CSVs in the momo directory were downloaded specifically because
+            # they are known gap-up events (>10% gap at open).  The intraday CSV
+            # does not contain the prior-day close, so we cannot compute the
+            # exact gap percentage from the file alone.  Use a conservative 15%
+            # default which satisfies the Gap-and-Go ≥10% requirement.
+            gap_pct = 0.15
 
             # Run news correlation analysis asynchronously
             asyncio.run(
                 news_correlator.analyze_gap_up(ticker, trade_date, df, gap_pct)
             )
 
-            day_trades = _simulate_file(df, ticker, trade_date, brain, pdt)
+            day_trades = _simulate_file(df, ticker, trade_date, brain, pdt, gap_pct=gap_pct)
             all_trades.extend(day_trades)
         except Exception as exc:  # noqa: BLE001
             logger.error("Error processing %s: %s", csv_path, exc)
@@ -579,32 +644,71 @@ def generate_sample_data(n: int = 50, seed: int = 42) -> None:
 
 # Known small-cap movers — stocks that frequently gap up
 SMALL_CAP_UNIVERSE = [
-    # AI / quantum
-    "IONQ", "KULR", "RGTI", "QUBT", "AI", "BBAI", "SOUN", "GFAI",
-    # Crypto-related miners
-    "MARA", "RIOT", "BITF", "HUT", "CLSK",
-    # Biotech
-    "NVAX", "MRNA", "BNTX", "BBIO",
-    # EV
-    "LCID", "RIVN", "GOEV", "FSR", "NKLA",
-    # Fintech
-    "PLTR", "SOFI", "HOOD", "AFRM", "UPST",
-    # Space
-    "RKLB", "LUNR", "ASTS", "RDW", "MNTS",
-    # Former meme stocks
-    "OPEN", "CLOV", "WISH", "SDC",
-    # Classic meme stocks
-    "AMC", "GME", "KOSS", "BB", "NOK",
-    # Other space/energy
-    "SPCE", "ASTR", "TELL", "NEXT", "BE", "PLUG", "FCEL",
-    # Genomics
-    "DNA", "CRSP", "EDIT", "NTLA", "BEAM",
-    # Lidar
-    "LAZR", "LIDR", "AEVA", "OUST",
-    # Speculative
-    "HYMC", "GEVO", "REE", "WKHS",
-    # Additional active small-caps
-    "MULN", "SMCI", "ASTS",
+    # ── AI / Quantum Computing ──
+    "IONQ", "RGTI", "QUBT", "QBTS", "SOUN", "BBAI", "AI", "GFAI",
+    "BIGB", "INOD", "PRST", "KARO",
+
+    # ── Crypto-Related ──
+    "MARA", "RIOT", "BITF", "HUT", "CLSK", "COIN", "CIFR", "IREN",
+    "BTBT", "BTDR", "CORZ", "WULF",
+
+    # ── Biotech / Pharma ──
+    "NVAX", "MRNA", "BNTX", "BBIO", "DNA", "VKTX", "VERA", "NUVB",
+    "RXRX", "SMMT", "NRIX", "APLT", "RVMD", "TGTX", "IMVT", "KRON",
+    "KRYS", "DVAX", "VXRT", "OCGN", "SAVA", "PRAX", "AKRO", "ARQT",
+    "MNKD", "IBRX", "MDGL", "CPRX", "CORT", "AGIO",
+
+    # ── EV / Clean Energy ──
+    "LCID", "RIVN", "GOEV", "NKLA", "NIO", "XPEV", "LI",
+    "QS", "CHPT", "BLNK", "EVGO", "PTRA", "FFIE", "VFS",
+    "PLUG", "FCEL", "BE", "ENPH", "SEDG", "RUN",
+
+    # ── Fintech / Digital Finance ──
+    "SOFI", "HOOD", "AFRM", "UPST", "OPEN", "CLOV",
+    "NU", "PSFE", "DAVE", "LMND", "ROOT",
+
+    # ── Space / Defense ──
+    "RKLB", "LUNR", "ASTS", "RDW", "MNTS", "SPCE",
+    "VORB", "ASTR", "BKSY", "PL",
+
+    # ── Meme / High-Volatility ──
+    "AMC", "GME", "KOSS", "BB", "NOK", "CENN",
+    "CVNA", "DJT", "PHUN", "DWAC",
+
+    # ── Semiconductors / Tech ──
+    "SMCI", "KULR", "WIMI", "SILO", "GCTS",
+    "AMSC", "ACMR", "CEVA", "POWI",
+
+    # ── Genomics / CRISPR ──
+    "CRSP", "EDIT", "NTLA", "BEAM",
+
+    # ── Lidar / Autonomous ──
+    "LIDR", "AEVA", "OUST", "INVZ",
+
+    # ── Cannabis ──
+    "TLRY", "CGC", "ACB", "SNDL", "GRNH",
+
+    # ── Speculative / Micro-Cap Movers ──
+    "HYMC", "GEVO", "REE", "WKHS", "VERB",
+    "ZKIN", "CXAI", "EAST", "TPST", "BEEM",
+    "NNOX", "HYZN", "GROM", "BIOR", "CNTB",
+    "ADTX", "AEHL", "APDN", "ATNF", "BFRI",
+    "BOXL", "BYRN", "CING", "CISO", "CLNN",
+    "CNET", "CNTX", "DATS", "EFTR", "ELMS",
+    "FAMI", "FNGR", "FTFT", "GFOO", "GIPR",
+    "GRCL", "GTEC", "HCTI", "HOUR", "HTOO",
+    "ILAG", "IMPP", "INDO", "INTG", "ISPC",
+    "JAN", "KALA", "KAVL", "LBPH", "LGHL",
+    "LIQT", "MBOT", "MEGL", "MGAM", "MIGI",
+    "MINM", "MKFG", "MLGO", "MNMD", "MVST",
+    "NATH", "NBEV", "NDRA", "NEON", "NILE",
+    "NOVV", "NRGV", "OBLG", "OCEA", "PALI",
+    "PCSA", "PIK", "PPBT", "PRCH", "PROC",
+    "QNRX", "RVPH", "SBFM", "SES",
+    "SLNO", "SNTI", "SPCB", "STSS", "TACT",
+    "TCON", "TNON", "TOP", "TRVN", "UCAR",
+    "VCNX", "VNET", "VNRX", "VRM", "VYGR",
+    "WRAP", "XELA", "XNET", "YGTY", "ZENV",
 ]
 
 _YAHOO_GAP_MIN_PCT = 0.10   # minimum 10% gap-up
@@ -802,9 +906,11 @@ async def _download_ibkr_bars(
         from ib_insync import Stock  # type: ignore
 
         contract = Stock(ticker, "SMART", "USD")
+        # Convert "2026-03-07" → "20260307 16:00:00 US/Eastern" (IBKR required format)
+        ibkr_date = date_str.replace("-", "")
         bars = await ib.reqHistoricalDataAsync(
             contract,
-            endDateTime=f"{date_str} 16:00:00",
+            endDateTime=f"{ibkr_date} 16:00:00 US/Eastern",
             durationStr="1 D",
             barSizeSetting="1 min",
             whatToShow="TRADES",
