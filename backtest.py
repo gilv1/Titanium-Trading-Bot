@@ -52,13 +52,13 @@ CONTRACT_MULTIPLIERS: dict[str, float] = {
     "NQ": 20,
 }
 
-# Trailing stop progression thresholds (in points).
+# Trailing stop progression thresholds (in points) — tuned for MNQ's wider moves.
 # When profit reaches TRAIL_BREAKEVEN_PTS, move SL to entry+1.
 # When profit reaches TRAIL_TIGHT_PTS, trail SL at price - TRAIL_TIGHT_OFFSET_PTS.
-TRAIL_BREAKEVEN_PTS: float = 10.0
+TRAIL_BREAKEVEN_PTS: float = 20.0
 TRAIL_BREAKEVEN_OFFSET_PTS: float = 1.0
-TRAIL_TIGHT_PTS: float = 15.0
-TRAIL_TIGHT_OFFSET_PTS: float = 5.0
+TRAIL_TIGHT_PTS: float = 30.0
+TRAIL_TIGHT_OFFSET_PTS: float = 10.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -99,7 +99,9 @@ def simulate(df: pd.DataFrame, ticker: str, brain: AIBrain, reto: RetoTracker) -
     gross_loss = 0.0
 
     contract_mult = CONTRACT_MULTIPLIERS.get(ticker.upper(), 1)
-    is_futures_no_orb = ticker.upper() in ("MES", "ES")
+    # ORB is disabled for MES, ES, MNQ (too choppy / prone to false breakouts).
+    # NQ retains ORB detection.
+    is_futures_no_orb = ticker.upper() in ("MES", "ES", "MNQ")
 
     window = 50  # minimum bars needed before trading
 
@@ -275,6 +277,77 @@ def simulate(df: pd.DataFrame, ticker: str, brain: AIBrain, reto: RetoTracker) -
 # ──────────────────────────────────────────────────────────────
 
 
+def download_mnq_data() -> None:
+    """
+    Download 60 days of MNQ 1-minute bars from IBKR and save to data/historical/MNQ_1min.csv.
+
+    Requires TWS / IB Gateway to be running.  Fails gracefully if no connection is available.
+    """
+    try:
+        from ib_insync import IB, Future  # type: ignore
+    except ImportError:
+        print("[download] ib_insync is not installed.  Run: pip install ib_insync")
+        return
+
+    ib = IB()
+    host = settings.IBKR_HOST
+    port = settings.IBKR_PORT
+
+    print(f"[download] Connecting to IBKR at {host}:{port} …")
+    try:
+        ib.connect(host, port, clientId=99, timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[download] Could not connect to IBKR: {exc}")
+        print("           Make sure TWS or IB Gateway is running and accepting API connections.")
+        return
+
+    try:
+        from datetime import datetime as _dt
+
+        contract = Future("MNQ", "", "CME")
+        ib.qualifyContracts(contract)
+
+        print("[download] Requesting 60 days of MNQ 1-min bars …")
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr="60 D",
+            barSizeSetting="1 min",
+            whatToShow="TRADES",
+            useRTH=False,
+            formatDate=1,
+        )
+
+        if not bars:
+            print("[download] No bars returned.  Check that MNQ is a valid front-month contract.")
+            return
+
+        df = pd.DataFrame(
+            {
+                "time": [b.date for b in bars],
+                "open": [b.open for b in bars],
+                "high": [b.high for b in bars],
+                "low": [b.low for b in bars],
+                "close": [b.close for b in bars],
+                "volume": [b.volume for b in bars],
+            }
+        )
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = DATA_DIR / "MNQ_1min.csv"
+        df.to_csv(out_path, index=False)
+
+        print(
+            f"[download] Saved {len(df):,} bars to {out_path}\n"
+            f"           Date range: {df['time'].iloc[0]} → {df['time'].iloc[-1]}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[download] Error downloading MNQ data: {exc}")
+    finally:
+        ib.disconnect()
+        print("[download] Disconnected from IBKR.")
+
+
 def run() -> None:
     """
     Run backtests for all CSV files found in ``data/historical/``.
@@ -358,9 +431,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Run the Event Impact Analyzer instead of the normal backtest.",
     )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download 60 days of MNQ 1-min bars from IBKR to data/historical/MNQ_1min.csv.",
+    )
     args = parser.parse_args()
 
-    if args.analyze_events:
+    if args.download:
+        download_mnq_data()
+    elif args.analyze_events:
         from core.event_analyzer import EventAnalyzer
         analyzer = EventAnalyzer()
         analyzer.run()

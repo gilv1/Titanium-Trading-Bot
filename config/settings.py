@@ -43,7 +43,7 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 # ──────────────────────────────────────────────────────────────
 ENABLE_FUTURES: bool = os.getenv("ENABLE_FUTURES", "true").lower() == "true"
 ENABLE_OPTIONS: bool = os.getenv("ENABLE_OPTIONS", "false").lower() == "true"
-ENABLE_MOMO: bool = os.getenv("ENABLE_MOMO", "false").lower() == "true"
+ENABLE_MOMO: bool = os.getenv("ENABLE_MOMO", "true").lower() == "true"
 ENABLE_CRYPTO: bool = os.getenv("ENABLE_CRYPTO", "false").lower() == "true"
 
 # ──────────────────────────────────────────────────────────────
@@ -61,6 +61,12 @@ MAX_DAILY_RISK_PCT: float = float(os.getenv("MAX_DAILY_RISK_PCT", "8"))
 MAX_SIMULTANEOUS_POSITIONS: int = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
 KILL_SWITCH_PCT: float = float(os.getenv("KILL_SWITCH_PCT", "12"))
 INITIAL_CAPITAL: float = float(os.getenv("INITIAL_CAPITAL", "500"))
+
+# ──────────────────────────────────────────────────────────────
+# Futures Instrument
+# ──────────────────────────────────────────────────────────────
+FUTURES_TICKER: str = os.getenv("FUTURES_TICKER", "MNQ")
+FUTURES_MULTIPLIER: int = int(os.getenv("FUTURES_MULTIPLIER", "2"))
 
 # ──────────────────────────────────────────────────────────────
 # Trading Mode
@@ -91,12 +97,12 @@ class PhaseConfig:
 PHASES: dict[int, PhaseConfig] = {
     1: PhaseConfig(
         phase=1,
-        min_capital=500.0,      # $500-$2,999 → MES (1 contract)
+        min_capital=500.0,      # $500-$2,999 → MNQ (1 contract)
         max_capital=3000.0,
         futures_contracts=1,
-        futures_instrument="MES",
-        futures_sl_pts=10,
-        futures_tp_pts=20,
+        futures_instrument="MNQ",
+        futures_sl_pts=15,
+        futures_tp_pts=30,
         options_max_capital=50.0,
         momo_max_capital=100.0,
         sessions=["NY"],
@@ -104,12 +110,12 @@ PHASES: dict[int, PhaseConfig] = {
     ),
     2: PhaseConfig(
         phase=2,
-        min_capital=3000.0,     # $3,000-$4,999 → MES (2 contracts)
+        min_capital=3000.0,     # $3,000-$4,999 → MNQ (2 contracts)
         max_capital=5000.0,
         futures_contracts=2,
-        futures_instrument="MES",
-        futures_sl_pts=10,
-        futures_tp_pts=20,
+        futures_instrument="MNQ",
+        futures_sl_pts=15,
+        futures_tp_pts=30,
         options_max_capital=100.0,
         momo_max_capital=250.0,
         sessions=["London", "NY"],

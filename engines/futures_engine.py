@@ -37,6 +37,7 @@ from analysis.technical import calculate_atr, calculate_ema, calculate_rsi, calc
 from config import settings
 from core.news_sentinel import MarketContext, NewsSentinel
 from core.reto_tracker import TradeResult as RetoTradeResult
+from core.risk_manager import DynamicTrailingLock
 from engines.base_engine import BaseEngine, Position, Setup, Signal, TradeResult
 
 if TYPE_CHECKING:
@@ -47,6 +48,13 @@ if TYPE_CHECKING:
     from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+# Hard trading cutoff — no new MNQ trades after 12:30 PM ET
+FUTURES_HARD_CUTOFF_HOUR: int = 12
+FUTURES_HARD_CUTOFF_MINUTE: int = 30
+
+# Daily P&L milestone thresholds (%) for Telegram alerts
+_MILESTONE_PCTS: list[int] = [10, 20, 30, 40, 50, 75, 100]
 
 
 def _get_front_month_expiry() -> str:
@@ -110,6 +118,12 @@ class FuturesEngine(BaseEngine):
         self._entry_trade: Any = None  # tracked to detect async cancellations
         self._news_sentinel: NewsSentinel = news_sentinel if news_sentinel is not None else NewsSentinel()
         self._last_market_context: MarketContext | None = None
+        # Dynamic trailing profit lock (resets each day)
+        self._trailing_lock: DynamicTrailingLock = DynamicTrailingLock()
+        # P&L milestone alerts already sent today (prevents duplicate notifications)
+        self._milestones_hit: set[int] = set()
+        # Suppress repeated cutoff log lines
+        self._cutoff_logged: bool = False
 
     def get_engine_name(self) -> str:
         return "futures"
@@ -165,6 +179,34 @@ class FuturesEngine(BaseEngine):
                 if start_minutes <= current_minutes < end_minutes:
                     return sess_name
         return "NY"
+
+    def _is_past_cutoff(self) -> bool:
+        """Return True if it is past 12:30 PM ET — no new MNQ trades after this time."""
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(tz=ZoneInfo(settings.TIMEZONE))
+        return now.hour > FUTURES_HARD_CUTOFF_HOUR or (
+            now.hour == FUTURES_HARD_CUTOFF_HOUR and now.minute >= FUTURES_HARD_CUTOFF_MINUTE
+        )
+
+    async def _check_milestones(self, daily_pnl: float, capital: float) -> None:
+        """Send Telegram alerts when daily P&L crosses percentage milestones."""
+        if self._telegram is None or capital <= 0:
+            return
+
+        pnl_pct = (daily_pnl / capital) * 100
+
+        for m in _MILESTONE_PCTS:
+            if pnl_pct >= m and m not in self._milestones_hit:
+                self._milestones_hit.add(m)
+                asyncio.create_task(
+                    self._telegram._send(
+                        f"🎯 <b>MILESTONE +{m}%</b>\n"
+                        f"P&amp;L: ${daily_pnl:.2f} ({pnl_pct:.1f}%)\n"
+                        f"Peak: ${self._trailing_lock.peak_pnl:.2f}\n"
+                        f"Capital: ${capital + daily_pnl:.2f}"
+                    )
+                )
 
     # ──────────────────────────────────────────────────────────
     # News Sentinel integration
@@ -242,6 +284,28 @@ class FuturesEngine(BaseEngine):
 
     async def scan_for_setups(self) -> list[Setup]:
         """Detect all 5 futures setups on the latest 1-minute bars."""
+        # ── Hard 12:30 PM ET cutoff — no new trades after this time ──────────
+        if self._is_past_cutoff():
+            if not self._cutoff_logged:
+                logger.info(
+                    "[futures] 12:30 PM ET cutoff reached — no new trades for the rest of the day."
+                )
+                self._cutoff_logged = True
+            return []
+
+        # Reset cutoff flag if we're before the cutoff (e.g. new day)
+        self._cutoff_logged = False
+
+        # ── Dynamic trailing lock check ───────────────────────────────────────
+        current_pnl = self._reto.get_daily_pnl().pnl if self._reto is not None else 0.0
+        if self._trailing_lock.update(current_pnl):
+            logger.info(
+                "[futures] 🔒 Trailing lock active (peak=$%.2f, protected=$%.2f) — no new scans.",
+                self._trailing_lock.peak_pnl,
+                self._trailing_lock.locked_amount,
+            )
+            return []
+
         contract = self._get_contract()
         if contract is None:
             return []
@@ -298,6 +362,43 @@ class FuturesEngine(BaseEngine):
         if self._order_pending:
             logger.warning("[futures] Order already pending — skipping duplicate bracket order.")
             return None
+
+        # ── Hard 12:30 PM ET cutoff ───────────────────────────────────────────
+        if self._is_past_cutoff():
+            logger.info("[futures] Trade blocked: past 12:30 PM ET cutoff.")
+            return None
+
+        # ── Dynamic trailing lock check ───────────────────────────────────────
+        current_pnl = self._reto.get_daily_pnl().pnl if self._reto is not None else 0.0
+        if self._trailing_lock.update(current_pnl):
+            logger.info(
+                "[futures] 🔒 PROFIT LOCKED at $%.2f (peak was $%.2f). Trading stopped for today.",
+                self._trailing_lock.locked_amount,
+                self._trailing_lock.peak_pnl,
+            )
+            if self._telegram:
+                asyncio.create_task(
+                    self._telegram._send(
+                        f"🔒 <b>PROFIT LOCKED</b>\n"
+                        f"Peak: ${self._trailing_lock.peak_pnl:.2f}\n"
+                        f"Protected: ${self._trailing_lock.locked_amount:.2f}\n"
+                        f"Trading stopped for today."
+                    )
+                )
+            return None
+
+        # ── Trailing lock trade restrictions (score + size adjustments) ───────
+        capital = self._reto.get_daily_pnl().starting_capital if self._reto is not None else settings.INITIAL_CAPITAL
+        restrictions = self._trailing_lock.get_trade_restrictions(current_pnl, capital)
+        if ai_score < restrictions["min_score"]:
+            logger.info(
+                "[futures] Trade skipped: score %d < trailing lock min %d (%s).",
+                ai_score,
+                restrictions["min_score"],
+                restrictions["reason"],
+            )
+            return None
+        size_multiplier *= restrictions["size_mult"]
 
         # ── News Sentinel check ───────────────────────────────────
         # Use cached context if available (set by _build_market_context in run_loop),
@@ -568,10 +669,18 @@ class FuturesEngine(BaseEngine):
                 if self._telegram:
                     asyncio.create_task(self._telegram.send_trade_exit(result))
 
-                # Milestone alerts
+                # Milestone alerts (capital milestones from RetoTracker)
                 for msg in milestones:
                     if self._telegram:
                         asyncio.create_task(self._telegram.send_milestone_alert(msg))
+
+                # Dynamic P&L milestone alerts (percentage gains in the day)
+                updated_daily_pnl = self._reto.get_daily_pnl().pnl if self._reto is not None else 0.0
+                start_capital = self._reto.get_daily_pnl().starting_capital if self._reto is not None else settings.INITIAL_CAPITAL
+                asyncio.create_task(self._check_milestones(updated_daily_pnl, start_capital))
+
+                # Update trailing lock with the latest P&L after the trade
+                self._trailing_lock.update(updated_daily_pnl)
 
         except Exception as exc:  # noqa: BLE001
             logger.error("[futures] Monitor error: %s", exc)
