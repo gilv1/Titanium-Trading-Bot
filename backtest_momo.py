@@ -116,7 +116,8 @@ class MomoSetup:
     entry_price: float
     raw_stop: float
     hour_of_day: int
-    df: pd.DataFrame
+    entry_minute: int = 30
+    df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -137,6 +138,7 @@ class MomoTrade:
     catalyst: str = ""
     shares: int = 1
     hour_of_day: int = 9
+    entry_minute: int = 30
 
 
 @dataclass
@@ -228,6 +230,7 @@ def _compute_atr(df: pd.DataFrame, i: int, period: int = 14) -> float:
     start = max(0, i - period)
     window = df.iloc[start : i + 1]
     if len(window) < 2:
+        # Fallback: 2% of price (typical intraday range for small-cap momentum stocks)
         return float(df["close"].iloc[i]) * 0.02
     trs = []
     for j in range(1, len(window)):
@@ -340,6 +343,14 @@ def _compute_setup_score(
     Returns (score, should_skip).
     should_skip=True means don't trade regardless of score
     (e.g. offering detected, float > 20M, insufficient volume).
+
+    Score weights (max 100):
+      Gap size:       max 20  (sweet spot 10–25%)
+      Rel volume:     max 20  (≥5× = monster)
+      News catalyst:  max 20  (FDA/contract = highest)
+      Float:          max 20  (< 10M shares = explosive)
+      Price range:    max 15  ($2–$10 = sweet spot)
+      Daily trend:    max 10  (uptrend alignment)
     """
     # Red flag: stock offering → immediate skip (improvement #11)
     if has_offering:
@@ -816,6 +827,7 @@ def _pre_scan_file(
                 entry_price=sig["entry"],
                 raw_stop=sig["sl"],
                 hour_of_day=hour,
+                entry_minute=minute,
                 df=df,
             )
         ]
@@ -1008,6 +1020,7 @@ def _simulate_trade(setup: MomoSetup, brain: AIBrain) -> Optional[MomoTrade]:
         catalyst=setup.catalyst,
         shares=shares,
         hour_of_day=setup.hour_of_day,
+        entry_minute=setup.entry_minute,
     )
 
 
@@ -1060,16 +1073,17 @@ def _aggregate_stats(
     wins_by_hour: dict[str, int] = {k: 0 for k in hour_labels}
     trades_by_hour: dict[str, int] = {k: 0 for k in hour_labels}
 
-    def _hour_label(hour: int) -> str:
-        t = hour * 60
-        if t < 10 * 60 + 15:
+    def _hour_label(hour: int, minute: int = 0) -> str:
+        """Map entry hour+minute to the session time bucket label."""
+        t = hour * 60 + minute   # total minutes from midnight
+        if t < 10 * 60 + 15:    # before 10:15
             return "9:30-10:15"
-        elif t < 11 * 60:
+        elif t < 11 * 60:        # 10:15 – 11:00
             return "10:15-11:00"
         return "11:00+"
 
     for t in all_trades:
-        lbl = _hour_label(t.hour_of_day)
+        lbl = _hour_label(t.hour_of_day, t.entry_minute)
         trades_by_hour[lbl] = trades_by_hour.get(lbl, 0) + 1
         if t.won:
             wins_by_hour[lbl] = wins_by_hour.get(lbl, 0) + 1
