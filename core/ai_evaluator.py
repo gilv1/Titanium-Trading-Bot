@@ -72,6 +72,7 @@ class AIEvaluator:
         daily_pnl_pct: float,
         instrument: str,
         open_positions: int,
+        market_context: str = "",
     ) -> AIEvaluation:
         """
         Send trade context to Groq for evaluation.
@@ -102,6 +103,7 @@ class AIEvaluator:
             daily_pnl_pct=daily_pnl_pct,
             instrument=instrument,
             open_positions=open_positions,
+            market_context=market_context,
         )
 
         # Try Groq first
@@ -219,6 +221,9 @@ TODAY'S PERFORMANCE:
 - Daily P&L: ${kwargs['daily_pnl']:.2f} ({kwargs['daily_pnl_pct']:.1f}%)
 - Day: {day_of_week}
 - Time: {hour}
+
+MARKET CONTEXT:
+{kwargs.get('market_context') or 'No macro data available'}
 
 HISTORICAL PERFORMANCE (from bot's learning memory):
 Setup win rates:
