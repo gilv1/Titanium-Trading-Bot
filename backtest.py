@@ -6,6 +6,7 @@ and AI Brain logic used in live trading.
 
 Usage:
     python backtest.py
+    python backtest.py --analyze-events
 
 Input CSV format (per file):
     time,open,high,low,close,volume
@@ -15,17 +16,20 @@ Saves results to ``journal/backtest_results.json``.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from analysis.patterns import (
+    check_higher_timeframe_trend,
     detect_ema_pullback,
+    detect_liquidity_grab,
     detect_orb,
     detect_vwap_bounce,
 )
@@ -39,6 +43,22 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data/historical")
 RESULTS_FILE = Path("journal/backtest_results.json")
+
+# Contract multipliers: points → dollars
+CONTRACT_MULTIPLIERS: dict[str, float] = {
+    "MES": 5,
+    "ES": 50,
+    "MNQ": 2,
+    "NQ": 20,
+}
+
+# Trailing stop progression thresholds (in points).
+# When profit reaches TRAIL_BREAKEVEN_PTS, move SL to entry+1.
+# When profit reaches TRAIL_TIGHT_PTS, trail SL at price - TRAIL_TIGHT_OFFSET_PTS.
+TRAIL_BREAKEVEN_PTS: float = 10.0
+TRAIL_BREAKEVEN_OFFSET_PTS: float = 1.0
+TRAIL_TIGHT_PTS: float = 15.0
+TRAIL_TIGHT_OFFSET_PTS: float = 5.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -78,6 +98,9 @@ def simulate(df: pd.DataFrame, ticker: str, brain: AIBrain, reto: RetoTracker) -
     gross_profit = 0.0
     gross_loss = 0.0
 
+    contract_mult = CONTRACT_MULTIPLIERS.get(ticker.upper(), 1)
+    is_futures_no_orb = ticker.upper() in ("MES", "ES")
+
     window = 50  # minimum bars needed before trading
 
     for i in range(window, len(df)):
@@ -89,14 +112,28 @@ def simulate(df: pd.DataFrame, ticker: str, brain: AIBrain, reto: RetoTracker) -
         atr_series = calculate_atr(window_df)
         atr = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
 
-        # Detect signal
-        signal: Signal | None = (
-            detect_vwap_bounce(window_df, vwap, rsi_series=rsi)
-            or detect_orb(window_df)
-            or detect_ema_pullback(window_df, ema9, ema21)
-        )
+        # Detect signal — skip ORB for MES/ES futures
+        if is_futures_no_orb:
+            signal: Signal | None = (
+                detect_vwap_bounce(window_df, vwap, rsi_series=rsi)
+                or detect_ema_pullback(window_df, ema9, ema21)
+                or detect_liquidity_grab(window_df, [])
+            )
+        else:
+            signal = (
+                detect_vwap_bounce(window_df, vwap, rsi_series=rsi)
+                or detect_orb(window_df)
+                or detect_ema_pullback(window_df, ema9, ema21)
+                or detect_liquidity_grab(window_df, [])
+            )
 
         if signal is None:
+            continue
+
+        # Multi-timeframe confirmation: filter signals that disagree with the
+        # higher-timeframe trend
+        if not check_higher_timeframe_trend(window_df, signal.direction):
+            signal = None
             continue
 
         # AI Brain evaluation
@@ -112,36 +149,65 @@ def simulate(df: pd.DataFrame, ticker: str, brain: AIBrain, reto: RetoTracker) -
         if not decision.approved:
             continue
 
-        # Simulate trade outcome using next bar
+        # Simulate trade with trailing stop over next 10 bars
         if i + 1 >= len(df):
             break
 
-        next_bar = df.iloc[i + 1]
-        entry = signal.entry_price
-        sl = signal.stop_price
-        tp = signal.target_price
+        trade_pnl = 0.0
+        hit = False
+        trailing_stop = signal.stop_price
 
-        # Determine fill (simplified: if next bar hits TP before SL → win)
-        if signal.direction == "LONG":
-            hit_tp = float(next_bar["high"]) >= tp
-            hit_sl = float(next_bar["low"]) <= sl
-        else:
-            hit_tp = float(next_bar["low"]) <= tp
-            hit_sl = float(next_bar["high"]) >= sl
+        for j in range(i + 1, min(i + 11, len(df))):
+            bar = df.iloc[j]
 
-        if hit_tp and not hit_sl:
-            trade_pnl = abs(tp - entry)
-            won = True
-        elif hit_sl:
-            trade_pnl = -abs(entry - sl)
-            won = False
-        else:
-            # Neither hit — close at end of next bar
-            close_price = float(next_bar["close"])
-            trade_pnl = (close_price - entry) if signal.direction == "LONG" else (entry - close_price)
-            won = trade_pnl > 0
+            if signal.direction == "LONG":
+                # Check stop hit
+                if float(bar["low"]) <= trailing_stop:
+                    trade_pnl = trailing_stop - signal.entry_price
+                    hit = True
+                    break
+                # Check target hit
+                if float(bar["high"]) >= signal.target_price:
+                    trade_pnl = signal.target_price - signal.entry_price
+                    hit = True
+                    break
+                # Trail stop upward
+                current_high = float(bar["high"])
+                if current_high - signal.entry_price >= TRAIL_BREAKEVEN_PTS:
+                    trailing_stop = max(trailing_stop, signal.entry_price + TRAIL_BREAKEVEN_OFFSET_PTS)
+                if current_high - signal.entry_price >= TRAIL_TIGHT_PTS:
+                    trailing_stop = max(trailing_stop, current_high - TRAIL_TIGHT_OFFSET_PTS)
+            else:  # SHORT
+                # Check stop hit
+                if float(bar["high"]) >= trailing_stop:
+                    trade_pnl = signal.entry_price - trailing_stop
+                    hit = True
+                    break
+                # Check target hit
+                if float(bar["low"]) <= signal.target_price:
+                    trade_pnl = signal.entry_price - signal.target_price
+                    hit = True
+                    break
+                # Trail stop downward
+                current_low = float(bar["low"])
+                if signal.entry_price - current_low >= TRAIL_BREAKEVEN_PTS:
+                    trailing_stop = min(trailing_stop, signal.entry_price - TRAIL_BREAKEVEN_OFFSET_PTS)
+                if signal.entry_price - current_low >= TRAIL_TIGHT_PTS:
+                    trailing_stop = min(trailing_stop, current_low + TRAIL_TIGHT_OFFSET_PTS)
 
-        # Apply multiplier from brain
+        if not hit:
+            last_bar = df.iloc[min(i + 10, len(df) - 1)]
+            if signal.direction == "LONG":
+                trade_pnl = float(last_bar["close"]) - signal.entry_price
+            else:
+                trade_pnl = signal.entry_price - float(last_bar["close"])
+
+        won = trade_pnl > 0
+
+        # Apply contract multiplier (points → dollars)
+        trade_pnl *= contract_mult
+
+        # Apply brain size multiplier
         trade_pnl *= decision.size_multiplier
 
         capital += trade_pnl
@@ -269,7 +335,7 @@ def run() -> None:
                     "profit_factor": stats.profit_factor,
                     "starting_capital": stats.starting_capital,
                     "ending_capital": stats.ending_capital,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
@@ -285,4 +351,18 @@ def run() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s — %(message)s")
-    run()
+
+    parser = argparse.ArgumentParser(description="Titanium Warrior Backtester")
+    parser.add_argument(
+        "--analyze-events",
+        action="store_true",
+        help="Run the Event Impact Analyzer instead of the normal backtest.",
+    )
+    args = parser.parse_args()
+
+    if args.analyze_events:
+        from core.event_analyzer import EventAnalyzer
+        analyzer = EventAnalyzer()
+        analyzer.run()
+    else:
+        run()
