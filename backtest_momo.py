@@ -835,16 +835,20 @@ def _pre_scan_file(
         if sig is None:
             continue
 
-        # Adjust score based on entry type (Pullback proven winner)
+        # Adjust score based on entry type (Dip proven winner — 60% WR)
         entry_type = sig["entry_type"]
         entry_score = score
-        if entry_type == "Pullback":
-            entry_score += 10   # Pullback is proven winner — bonus
-        elif entry_type == "Dip":
-            entry_score += 0    # Neutral — don't penalize
+        if entry_type == "Dip":
+            entry_score += 10   # Dip is proven winner — 60% WR — bonus
+        elif entry_type == "Pullback":
+            entry_score += 0    # Neutral (was +10, data shows 25% WR)
         elif entry_type == "Breakout":
-            entry_score += 0    # Neutral — don't penalize
+            entry_score += 0    # Neutral (filtered by minimum below)
         entry_score = max(0, entry_score)
+
+        # Only take Breakout entries when the setup is exceptionally strong
+        if entry_type == "Breakout" and entry_score < 80:
+            continue  # SKIP — Breakout has 25% WR; only enter on very high score
 
         return [
             MomoSetup(
