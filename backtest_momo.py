@@ -84,11 +84,11 @@ MAX_ABOVE_OPEN_TO_ENTER = 0.15     # skip if price >15% above open
 MAX_CONSEC_GREEN_BEFORE_ENTRY = 3  # skip if 3+ consecutive green candles
 
 # ── Entry volume multiplier (FIX #8) ──
-ENTRY_VOLUME_MULT = 3.0   # entry bar must be ≥3× avg volume (was 2×)
+ENTRY_VOLUME_MULT = 2.0   # entry bar must be ≥2× avg volume
 
 # ── Score thresholds (improvement #5) ──
-SCORE_FULL = 75   # full position
-SCORE_HALF = 65   # half position; below 65 = no entry
+SCORE_FULL = 65   # full position
+SCORE_HALF = 55   # half position; below 55 = no entry
 
 # ── In-memory daily-trend cache (improvement #13) ──
 _daily_trend_cache: dict[tuple[str, str], str] = {}
@@ -214,7 +214,7 @@ def _min_score_for_time(hour: int, minute: int) -> int:
     """Return the minimum score required to enter at this time of day (FIX #1)."""
     t = hour * 60 + minute
     if t <= 10 * 60 + 15:      # 9:30–10:15 (inclusive) — best window
-        return 65
+        return 55
     elif t < 10 * 60 + 30:     # 10:16–10:29 — exceptional setups only
         return 90
     else:                        # 10:30+ — DO NOT ENTER ANY TRADES
@@ -377,16 +377,16 @@ def _compute_setup_score(
     else:
         return 0, True   # insufficient volume → skip trade
 
-    # News/Catalyst scoring (FIX #6: unknown = −10 penalty)
+    # News/Catalyst scoring
     cat = catalyst or "unknown"
     if cat in ("fda_approval", "contract_announcement"):
-        score += 15   # FIX #7: was 20
+        score += 15
     elif cat in ("earnings_beat", "partnership", "merger_acquisition"):
-        score += 12   # FIX #7: was 15
+        score += 12
     elif cat in ("analyst_upgrade", "insider_buying"):
-        score += 8    # FIX #7: was 10
+        score += 8
     elif cat in ("unknown", "sector_momentum", ""):
-        score -= 10   # FIX #6: no known catalyst = less edge (was +0)
+        score += 0   # Neutral — don't penalize for missing historical news
 
     # Float scoring (from whiteboard: float under 10M is the rule)
     if float_shares > 0:
@@ -434,11 +434,12 @@ def _obvious_check(
     price: float,
 ) -> bool:
     """
-    At least 3 of 5 criteria must be GREEN for the setup to be 'OBVIOUS'.
+    At least 2 of 5 criteria must be GREEN for the setup to be 'OBVIOUS'.
     If you have to think about it, it's not a trade (whiteboard rule).
+    Lowered from 3 to 2 because news and float data are often unavailable historically.
     """
     passed = 0
-    if gap_pct >= 0.10:
+    if gap_pct >= 0.07:
         passed += 1
     if rel_volume >= 3.0:
         passed += 1
@@ -448,7 +449,7 @@ def _obvious_check(
         passed += 1
     if 2.0 <= price <= 20.0:
         passed += 1
-    return passed >= 3
+    return passed >= 2
 
 
 # ──────────────────────────────────────────────────────────────
@@ -692,21 +693,23 @@ def _pre_scan_file(
     else:
         df = df.reset_index(drop=True)
 
-    if len(df) < 15 or gap_pct < 0.10:
+    if len(df) < 15 or gap_pct < 0.07:
         return []
 
     open_price = float(df["open"].iloc[0])
     if not (1.0 <= open_price <= 20.0):
         return []
 
-    # FIX #5: Estimate float when data is missing — stocks under $5 typically low float
+    # Estimate float when data is missing — stocks under $5 typically low float
     if float_shares <= 0:
-        if open_price < 5.0:
-            float_shares = 5_000_000    # assume 5M (passes <10M filter)
+        if open_price < 3.0:
+            float_shares = 3_000_000    # assume 3M (very low float)
+        elif open_price < 5.0:
+            float_shares = 5_000_000    # assume 5M
         elif open_price < 10.0:
-            float_shares = 15_000_000   # assume 15M (moderate)
+            float_shares = 15_000_000   # assume 15M
         else:
-            float_shares = 30_000_000   # assume 30M (likely filtered out)
+            float_shares = 30_000_000   # assume 30M
 
     # Relative volume
     rel_volume = _calc_rel_volume(df)
@@ -759,7 +762,7 @@ def _pre_scan_file(
         else:
             score += 5
 
-    # "Obvious" check (3 of 5)
+    # "Obvious" check (2 of 5)
     obvious = _obvious_check(gap_pct, rel_volume, has_news, float_shares, open_price)
     if not obvious:
         return []
@@ -767,13 +770,6 @@ def _pre_scan_file(
     # Find first valid entry signal in the session
     vwap = calculate_vwap(df)
     ema9 = calculate_ema(df, 9)
-
-    # FIX #9: Skip stock if VWAP is lost in the first 5 minutes after gap-up
-    for k in range(min(5, len(df))):
-        bar_close = float(df["close"].iloc[k])
-        bar_vwap = float(vwap.iloc[k]) if k < len(vwap) and not vwap.empty else 0.0
-        if bar_vwap > 0 and bar_close < bar_vwap:
-            return []   # gap is failing — don't look for any entry today
 
     for i in range(5, len(df)):
         # Determine bar time
@@ -839,15 +835,15 @@ def _pre_scan_file(
         if sig is None:
             continue
 
-        # FIX #2: Adjust score based on entry type (Pullback proven winner)
+        # Adjust score based on entry type (Pullback proven winner)
         entry_type = sig["entry_type"]
         entry_score = score
         if entry_type == "Pullback":
-            entry_score += 15
-        elif entry_type in ("Dip", "Breakout"):
-            entry_score -= 10
-            if entry_score < 85:
-                continue   # Dip/Breakout need exceptionally strong setup (score ≥85)
+            entry_score += 10   # Pullback is proven winner — bonus
+        elif entry_type == "Dip":
+            entry_score += 0    # Neutral — don't penalize
+        elif entry_type == "Breakout":
+            entry_score += 0    # Neutral — don't penalize
         entry_score = max(0, entry_score)
 
         return [
@@ -1461,87 +1457,109 @@ def generate_sample_data(n: int = 50, seed: int = 42) -> None:
 # Yahoo Finance downloader
 # ──────────────────────────────────────────────────────────────
 
-# Known small-cap movers — stocks that frequently gap up
-# (improvement #18: removed all Yahoo/IBKR download failures)
+# Known small-cap movers — stocks that frequently gap up (~300 active tickers)
 # Removed Yahoo failures: TCON, HYZN, EAST, GRCL, FFIE, VERB, DWAC, LBPH, MKFG,
 #   KRON, BIGB, OBLG, AKRO, VORB, NBEV, NILE, JAN, MINM, PTRA, YGTY, ATNF, NOVV,
-#   APDN, ASTR, ELMS
-# Removed IBKR "No security definition": ADTX, ASTR, CLVS, DVAX, EXPR, GFLO, GNUS,
-#   GXII, IDEX, LKCO, MMAT, MOGO, MRIN, MULN, NAKD, NKLA, PAYA, PROG, SFUN, SPRT,
-#   VERB, WISH
-SMALL_CAP_UNIVERSE = [
-    # ── AI / Quantum Computing ──
-    "IONQ", "RGTI", "QUBT", "QBTS", "SOUN", "BBAI", "AI", "GFAI",
-    "INOD", "PRST", "KARO",
+#   APDN, ELMS
+# Removed IBKR failures: ADTX, CLVS, DVAX, EXPR, GFLO, GNUS, GXII, IDEX, LKCO,
+#   MMAT, MOGO, MRIN, MULN, NAKD, NKLA, PAYA, PROG, SFUN, SPRT, VERB, WISH,
+#   FSR, SDC, LAZR, TELL
+SMALL_CAP_UNIVERSE: list[str] = [
+    # ── AI / Quantum Computing (20) ──
+    "IONQ", "RGTI", "QUBT", "QBTS", "SOUN", "BBAI", "GFAI",
+    "INOD", "PRST", "KARO", "ARQQ", "VNET", "AITX", "REKR",
+    "CXAI", "PAYO", "BTTR", "AUID", "MVIS", "LIDR",
 
-    # ── Crypto-Related ──
+    # ── Crypto-Related STOCKS (15) — these are STOCKS not coins ──
     "MARA", "RIOT", "BITF", "HUT", "CLSK", "COIN", "CIFR", "IREN",
-    "BTBT", "BTDR", "CORZ", "WULF",
+    "BTBT", "BTDR", "CORZ", "WULF", "BITX", "ARBK", "BKKT",
 
-    # ── Biotech / Pharma ──
+    # ── Biotech / Pharma (40) ──
     "NVAX", "MRNA", "BNTX", "BBIO", "DNA", "VKTX", "VERA", "NUVB",
     "RXRX", "SMMT", "NRIX", "APLT", "RVMD", "TGTX", "IMVT",
     "KRYS", "VXRT", "OCGN", "SAVA", "PRAX", "ARQT",
     "MNKD", "IBRX", "MDGL", "CPRX", "CORT", "AGIO",
+    "ACAD", "ALNY", "RARE", "IRWD", "HALO", "BHVN", "CRNX",
+    "ANNX", "LYEL", "CMPS", "ATAI", "CYRX", "GILD",
 
-    # ── EV / Clean Energy ──
+    # ── EV / Clean Energy (25) ──
     "LCID", "RIVN", "GOEV", "NIO", "XPEV", "LI",
     "QS", "CHPT", "BLNK", "EVGO", "VFS",
     "PLUG", "FCEL", "BE", "ENPH", "SEDG", "RUN",
+    "NOVA", "MAXN", "ARRY", "SHLS", "STEM", "OPAL",
+    "ENVX", "AMPX",
 
-    # ── Fintech / Digital Finance ──
+    # ── Fintech / Digital Finance (15) ──
     "SOFI", "HOOD", "AFRM", "UPST", "OPEN", "CLOV",
     "NU", "PSFE", "DAVE", "LMND", "ROOT",
+    "RELY", "TOST", "BILL", "NUVEI",
 
-    # ── Space / Defense ──
+    # ── Space / Defense (12) ──
     "RKLB", "LUNR", "ASTS", "RDW", "MNTS", "SPCE",
-    "BKSY", "PL",
+    "BKSY", "PL", "ASTR", "KTOS", "AVAV", "RCAT",
 
-    # ── Meme / High-Volatility ──
+    # ── Meme / High-Volatility STOCKS (15) — these are STOCKS not coins ──
     "AMC", "GME", "KOSS", "BB", "NOK", "CENN",
-    "CVNA", "DJT", "PHUN",
+    "CVNA", "DJT", "PHUN", "WKHS",
+    "IRNT", "ATER", "BBIG", "REV", "CRTD",
 
-    # ── Semiconductors / Tech ──
+    # ── Semiconductors / Tech (20) ──
     "SMCI", "KULR", "WIMI", "SILO", "GCTS",
-    "AMSC", "ACMR", "CEVA", "POWI",
+    "AMSC", "ACMR", "CEVA", "POWI", "WOLF",
+    "HIMX", "AOSL", "INDI", "OLED", "LSCC",
+    "SYNA", "DIOD", "SITM", "RMBS", "MPWR",
 
-    # ── Genomics / CRISPR ──
-    "CRSP", "EDIT", "NTLA", "BEAM",
+    # ── Genomics / CRISPR (8) ──
+    "CRSP", "EDIT", "NTLA", "BEAM", "VERV", "DNAY", "TWST", "PACB",
 
-    # ── Lidar / Autonomous ──
-    "LIDR", "AEVA", "OUST", "INVZ",
-
-    # ── Cannabis ──
+    # ── Cannabis (10) ──
     "TLRY", "CGC", "ACB", "SNDL", "GRNH",
+    "MAPS", "IIPR", "GNLN", "CRON", "OGI",
 
-    # ── Speculative / Micro-Cap Movers (verified working) ──
-    "HYMC", "GEVO", "REE", "WKHS",
-    "ZKIN", "CXAI", "TPST", "BEEM",
-    "NNOX", "GROM", "BIOR", "CNTB",
-    "AEHL", "BFRI",
-    "BOXL", "BYRN", "CING", "CISO", "CLNN",
+    # ── SPACs / Recent De-SPACs (15) ──
+    "BRDS", "IINN", "PROK", "EVTL", "HUMA",
+    "ALIT", "NAUT", "VIEW", "ARKO", "OUST",
+    "INVZ", "AEVA", "VLTA", "CMAX", "BRCC",
+
+    # ── Micro-Cap Movers $1-$5 (50) ──
+    "HYMC", "GEVO", "REE", "ZKIN",
+    "TPST", "BEEM", "NNOX", "GROM", "BIOR", "CNTB",
+    "BFRI", "BOXL", "BYRN", "CING", "CISO",
     "CNET", "CNTX", "DATS", "EFTR",
-    "FAMI", "FNGR", "FTFT", "GFOO", "GIPR",
+    "FAMI", "FNGR", "FTFT", "GIPR",
     "GTEC", "HCTI", "HOUR", "HTOO",
-    "ILAG", "IMPP", "INDO", "INTG", "ISPC",
-    "KALA", "KAVL", "LGHL",
-    "LIQT", "MBOT", "MEGL", "MGAM", "MIGI",
+    "ILAG", "IMPP", "INDO", "ISPC",
+    "KALA", "KAVL",
+    "MGAM", "MIGI",
     "MLGO", "MNMD", "MVST",
-    "NATH", "NDRA", "NEON",
+    "NDRA", "NEON",
     "NRGV", "OCEA", "PALI",
     "PCSA", "PIK", "PPBT", "PRCH", "PROC",
-    "QNRX", "RVPH", "SBFM", "SES",
-    "SLNO", "SNTI", "SPCB", "STSS", "TACT",
-    "TNON", "TOP", "TRVN", "UCAR",
-    "VCNX", "VNET", "VNRX", "VRM", "VYGR",
-    "WRAP", "XELA", "XNET", "ZENV",
+    "QNRX", "RVPH",
+
+    # ── Mid Small-Cap $5-$15 (35) ──
+    "DOCS", "FLYW", "GENI", "HIMS",
+    "HLIT", "INMD", "JOBY", "MTTR",
+    "PLTR", "PUBM", "REAL",
+    "RERE", "SGHC", "SKLZ", "SSYS", "TASK",
+    "TDUP", "TMCI", "TTCF", "TUYA", "TWKS",
+    "VINC", "VRM", "VYGR", "WEAV", "XELA",
+    "ZETA", "ZENV", "GRPN", "BFLY",
+
+    # ── China ADRs — volatile (10) ──
+    "BABA", "JD", "PDD", "BIDU", "TME",
+    "BILI", "IQ", "FUTU", "TIGR", "FINV",
+
+    # ── Mining / Materials (10) ──
+    "MP", "LAC", "UUUU", "DNN", "URG",
+    "CCJ", "LEU", "SMR", "LTBR", "NXE",
 ]
 
-_YAHOO_GAP_MIN_PCT = 0.10   # minimum 10% gap-up
+_YAHOO_GAP_MIN_PCT = 0.07   # minimum 7% gap-up
 _YAHOO_PRICE_MIN = 1.0      # minimum price $1
 _YAHOO_PRICE_MAX = 20.0     # maximum price $20
-_YAHOO_VOL_MIN = 100_000    # minimum volume 100K
-_YAHOO_SCAN_DAYS = 60       # look back 60 trading days
+_YAHOO_VOL_MIN = 100_000    # minimum volume 100K (baseline; see variable logic below)
+_YAHOO_SCAN_DAYS = 120      # look back 120 trading days
 _YAHOO_RECENT_DAYS = 7      # last 7 days → use 1-min bars; older → 5-min bars
 _YAHOO_TOP_GAPUPS_PER_DAY = 10  # keep top N gap-ups per day
 
@@ -1585,7 +1603,7 @@ def download_yahoo_data() -> None:
     """
     Download real historical gap-up intraday data from Yahoo Finance.
 
-    - Scans SMALL_CAP_UNIVERSE for gap-ups > 10% over last 60 trading days.
+    - Scans SMALL_CAP_UNIVERSE for gap-ups > 7% over last 120 trading days.
     - Downloads 1-min bars for the last 7 days; 5-min bars for older days.
     - Saves each to ``data/historical/momo/TICKER_YYYY-MM-DD.csv``.
     """
@@ -1608,7 +1626,7 @@ def download_yahoo_data() -> None:
     try:
         daily = yf.download(
             tickers_str,
-            period="3mo",
+            period="6mo",
             interval="1d",
             auto_adjust=True,
             progress=False,
@@ -1653,10 +1671,19 @@ def download_yahoo_data() -> None:
                     continue
 
                 gap_pct = (open_price - prev_close) / prev_close
+
+                # Variable volume minimum based on price
+                if open_price < 3.0:
+                    vol_min = 50_000    # Micro-caps have lower volume
+                elif open_price < 10.0:
+                    vol_min = 75_000    # Small-caps
+                else:
+                    vol_min = 100_000   # Normal threshold
+
                 if (
                     gap_pct >= _YAHOO_GAP_MIN_PCT
                     and _YAHOO_PRICE_MIN <= open_price <= _YAHOO_PRICE_MAX
-                    and volume >= _YAHOO_VOL_MIN
+                    and volume >= vol_min
                 ):
                     gap_events.append((ticker, bar_date.isoformat(), gap_pct))
         except Exception as exc:  # noqa: BLE001
