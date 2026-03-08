@@ -54,7 +54,7 @@ PDT_ROLLING_DAYS = 5
 
 # ── Trading hours (24-hour, Eastern) ──
 SESSION_START = (9, 30)
-SESSION_END = (12, 0)
+SESSION_END = (10, 30)  # Hard cutoff: momentum dies after 45–60 min (FIX #1)
 
 # ── Signal detection tolerances ──
 VWAP_TOLERANCE_PCT = 0.02     # within 2% of VWAP (small-caps are volatile)
@@ -69,8 +69,8 @@ MAX_POSITION_PCT = 0.20    # max 20% of capital in one trade
 # ── ATR-based stop loss (improvement #7) ──
 ATR_STOP_MULTIPLIER = 1.5   # stop = 1.5× ATR below entry
 ATR_TRAIL_MULTIPLIER = 1.0  # trailing stop = 1× ATR below running high
-MIN_STOP_PCT = 0.04         # minimum 4% stop
-MAX_STOP_PCT = 0.08         # maximum 8% stop
+MIN_STOP_PCT = 0.03         # minimum 3% stop (FIX #3: was 4%)
+MAX_STOP_PCT = 0.05         # maximum 5% stop (FIX #3: was 8% — avg loss too wide)
 
 # ── Scaled exit R-multiples (improvements #8, #9, #10) ──
 BREAKEVEN_R = 1.0   # move stop to break-even at +1R
@@ -82,6 +82,9 @@ TRAIL_R = 2.0       # switch to ATR-trailing stop after +2R (remaining 25%)
 MAX_ABOVE_VWAP_TO_ENTER = 0.15     # skip if price >15% above VWAP
 MAX_ABOVE_OPEN_TO_ENTER = 0.15     # skip if price >15% above open
 MAX_CONSEC_GREEN_BEFORE_ENTRY = 3  # skip if 3+ consecutive green candles
+
+# ── Entry volume multiplier (FIX #8) ──
+ENTRY_VOLUME_MULT = 3.0   # entry bar must be ≥3× avg volume (was 2×)
 
 # ── Score thresholds (improvement #5) ──
 SCORE_FULL = 75   # full position
@@ -208,16 +211,14 @@ class PDTTracker:
 
 
 def _min_score_for_time(hour: int, minute: int) -> int:
-    """Return the minimum score required to enter at this time of day."""
+    """Return the minimum score required to enter at this time of day (FIX #1)."""
     t = hour * 60 + minute
-    if t < 10 * 60 + 15:       # 9:30–10:15  — best window
-        return 60
-    elif t < 11 * 60:           # 10:15–11:00
-        return 70
-    elif t < 11 * 60 + 30:     # 11:00–11:30
-        return 80
-    else:                        # 11:30+  — almost never enters
+    if t <= 10 * 60 + 15:      # 9:30–10:15 (inclusive) — best window
+        return 65
+    elif t < 10 * 60 + 30:     # 10:16–10:29 — exceptional setups only
         return 90
+    else:                        # 10:30+ — DO NOT ENTER ANY TRADES
+        return 999
 
 
 # ──────────────────────────────────────────────────────────────
@@ -338,18 +339,18 @@ def _compute_setup_score(
     has_offering: bool = False,
 ) -> tuple[int, bool]:
     """
-    Compute setup quality score 0–100.
+    Compute setup quality score 0–100+.
 
     Returns (score, should_skip).
     should_skip=True means don't trade regardless of score
     (e.g. offering detected, float > 20M, insufficient volume).
 
-    Score weights (max 100):
-      Gap size:       max 20  (sweet spot 10–25%)
-      Rel volume:     max 20  (≥5× = monster)
-      News catalyst:  max 20  (FDA/contract = highest)
-      Float:          max 20  (< 10M shares = explosive)
-      Price range:    max 15  ($2–$10 = sweet spot)
+    Score weights (FIX #7 — rebalanced, max 100+):
+      Gap size:       max 25  (sweet spot 10–25%)
+      Rel volume:     max 25  (≥5× = monster)
+      News catalyst:  max 15  (FDA/contract = highest; unknown = −10)
+      Float:          max 15  (< 10M shares = explosive)
+      Price range:    max 10  ($2–$10 = sweet spot)
       Daily trend:    max 10  (uptrend alignment)
     """
     # Red flag: stock offering → immediate skip (improvement #11)
@@ -360,50 +361,51 @@ def _compute_setup_score(
 
     # Gap size scoring (10% minimum already enforced upstream)
     if 0.10 <= gap_pct <= 0.25:
-        score += 20   # sweet spot
+        score += 25   # sweet spot (FIX #7: was 20)
     elif 0.25 < gap_pct <= 0.50:
-        score += 15   # good but risky
+        score += 18   # good but risky (FIX #7: was 15)
     elif gap_pct > 0.50:
-        score += 5    # too extended, likely to reverse
+        score += 8    # too extended, likely to reverse (FIX #7: was 5)
 
     # Relative Volume scoring (MANDATORY: < 2× = no entry)
     if rel_volume >= 5.0:
-        score += 20   # monster volume
+        score += 25   # monster volume (FIX #7: was 20)
     elif rel_volume >= 3.0:
-        score += 15   # strong volume
+        score += 20   # strong volume (FIX #7: was 15)
     elif rel_volume >= 2.0:
-        score += 5    # marginal
+        score += 10   # marginal (FIX #7: was 5)
     else:
         return 0, True   # insufficient volume → skip trade
 
-    # News/Catalyst scoring
+    # News/Catalyst scoring (FIX #6: unknown = −10 penalty)
     cat = catalyst or "unknown"
     if cat in ("fda_approval", "contract_announcement"):
-        score += 20
+        score += 15   # FIX #7: was 20
     elif cat in ("earnings_beat", "partnership", "merger_acquisition"):
-        score += 15
+        score += 12   # FIX #7: was 15
     elif cat in ("analyst_upgrade", "insider_buying"):
-        score += 10
-    # "unknown" / "sector_momentum" → +0
+        score += 8    # FIX #7: was 10
+    elif cat in ("unknown", "sector_momentum", ""):
+        score -= 10   # FIX #6: no known catalyst = less edge (was +0)
 
     # Float scoring (from whiteboard: float under 10M is the rule)
     if float_shares > 0:
         if float_shares < 10_000_000:
-            score += 20   # low float = explosive
+            score += 15   # low float = explosive (FIX #7: was 20)
         elif float_shares < 20_000_000:
-            score += 10   # moderate float
+            score += 8    # moderate float (FIX #7: was 10)
         else:
             return score, True   # > 20M float → hard skip (whiteboard rule)
     else:
-        score += 10   # unknown float → moderate bonus; no hard skip
+        score += 8    # unknown float → moderate bonus; no hard skip (FIX #7: was 10)
 
     # Price range scoring ($2–$20 from whiteboard)
     if 2.0 <= price <= 10.0:
-        score += 15   # sweet spot
+        score += 10   # sweet spot (FIX #7: was 15)
     elif 1.0 <= price < 2.0:
-        score += 10   # penny stock territory
+        score += 5    # penny stock territory (FIX #7: was 10)
     elif 10.0 < price <= 20.0:
-        score += 10   # higher price, less explosive
+        score += 5    # higher price, less explosive (FIX #7: was 10)
 
     # Daily chart trend (improvement #13)
     if daily_trend == "uptrend":
@@ -580,10 +582,10 @@ def _detect_dip_buy(df: pd.DataFrame, i: int) -> Optional[dict]:
     if current_close < recovery_level:
         return None
 
-    # Volume spike on current (recovery) candle
+    # Volume spike on current (recovery) candle (FIX #8: 3× avg, was 2×)
     avg_vol = float(df["volume"].iloc[max(0, i - 20) : i].mean())
     curr_vol = float(df["volume"].iloc[i])
-    if avg_vol > 0 and curr_vol < avg_vol * 2.0:
+    if avg_vol > 0 and curr_vol < avg_vol * ENTRY_VOLUME_MULT:
         return None
 
     return {
@@ -612,8 +614,8 @@ def _detect_breakout_entry(df: pd.DataFrame, i: int) -> Optional[dict]:
     avg_vol = float(df["volume"].iloc[max(0, i - 20) : i].mean())
     curr_vol = float(df["volume"].iloc[i])
 
-    if avg_vol <= 0 or curr_vol < avg_vol * 2.0:
-        return None   # volume surge required
+    if avg_vol <= 0 or curr_vol < avg_vol * ENTRY_VOLUME_MULT:
+        return None   # volume surge required (FIX #8: 3× avg, was 2×)
 
     # HOD breakout
     prev_hod = float(df["high"].iloc[:i].max())
@@ -697,6 +699,15 @@ def _pre_scan_file(
     if not (1.0 <= open_price <= 20.0):
         return []
 
+    # FIX #5: Estimate float when data is missing — stocks under $5 typically low float
+    if float_shares <= 0:
+        if open_price < 5.0:
+            float_shares = 5_000_000    # assume 5M (passes <10M filter)
+        elif open_price < 10.0:
+            float_shares = 15_000_000   # assume 15M (moderate)
+        else:
+            float_shares = 30_000_000   # assume 30M (likely filtered out)
+
     # Relative volume
     rel_volume = _calc_rel_volume(df)
 
@@ -736,6 +747,18 @@ def _pre_scan_file(
     if should_skip:
         return []
 
+    # FIX #7: Price action quality bonus (first 5 bars)
+    if len(df) >= 5:
+        first_bar_green = float(df["close"].iloc[0]) > float(df["open"].iloc[0])
+        vols_early = [float(df["volume"].iloc[k]) for k in range(min(5, len(df)))]
+        volume_increasing = all(vols_early[k] > vols_early[k - 1] for k in range(1, len(vols_early)))
+        if first_bar_green and volume_increasing:
+            score += 15
+        elif first_bar_green:
+            score += 10
+        else:
+            score += 5
+
     # "Obvious" check (3 of 5)
     obvious = _obvious_check(gap_pct, rel_volume, has_news, float_shares, open_price)
     if not obvious:
@@ -744,6 +767,13 @@ def _pre_scan_file(
     # Find first valid entry signal in the session
     vwap = calculate_vwap(df)
     ema9 = calculate_ema(df, 9)
+
+    # FIX #9: Skip stock if VWAP is lost in the first 5 minutes after gap-up
+    for k in range(min(5, len(df))):
+        bar_close = float(df["close"].iloc[k])
+        bar_vwap = float(vwap.iloc[k]) if k < len(vwap) and not vwap.empty else 0.0
+        if bar_vwap > 0 and bar_close < bar_vwap:
+            return []   # gap is failing — don't look for any entry today
 
     for i in range(5, len(df)):
         # Determine bar time
@@ -758,17 +788,17 @@ def _pre_scan_file(
             hour = total_minutes // 60
             minute = total_minutes % 60
 
-        # Time-based score minimum (improvement #3)
+        # Time-based score minimum (FIX #1: hard cutoff at 10:30)
         min_score = _min_score_for_time(hour, minute)
         if score < min_score:
-            if hour * 60 + minute >= 12 * 60:
-                break   # past noon — stop looking
+            if hour * 60 + minute >= 10 * 60 + 30:
+                break   # 10:30+ — no more entries
             continue
 
-        # Volume filter on entry bar (improvement #2)
+        # Volume filter on entry bar (FIX #8: 3× avg, was 2×)
         avg_vol = float(df["volume"].iloc[max(0, i - 20) : i].mean())
         bar_vol = float(df["volume"].iloc[i])
-        if avg_vol > 0 and bar_vol < avg_vol * 2.0:
+        if avg_vol > 0 and bar_vol < avg_vol * ENTRY_VOLUME_MULT:
             continue
 
         # Anti-chase protection (improvement #4)
@@ -809,6 +839,17 @@ def _pre_scan_file(
         if sig is None:
             continue
 
+        # FIX #2: Adjust score based on entry type (Pullback proven winner)
+        entry_type = sig["entry_type"]
+        entry_score = score
+        if entry_type == "Pullback":
+            entry_score += 15
+        elif entry_type in ("Dip", "Breakout"):
+            entry_score -= 10
+            if entry_score < 85:
+                continue   # Dip/Breakout need exceptionally strong setup (score ≥85)
+        entry_score = max(0, entry_score)
+
         return [
             MomoSetup(
                 ticker=ticker,
@@ -820,9 +861,9 @@ def _pre_scan_file(
                 float_shares=float_shares,
                 price=price,
                 daily_trend=daily_trend,
-                score=score,
+                score=entry_score,
                 obvious_passed=obvious,
-                entry_type=sig["entry_type"],
+                entry_type=entry_type,
                 entry_bar=i,
                 entry_price=sig["entry"],
                 raw_stop=sig["sl"],
@@ -954,10 +995,20 @@ def _simulate_trade(setup: MomoSetup, brain: AIBrain) -> Optional[MomoTrade]:
         if bar_high > trail_high:
             trail_high = bar_high
 
-        # Break-even move at +1R (improvement #8)
+        # Break-even move at +1R (improvement #8 / FIX #4: verified working)
         if not be_moved and bar_high >= be_level:
             sl = max(sl, entry_price)
             be_moved = True
+
+        # FIX #3: VWAP hard stop — exit immediately if price drops below VWAP.
+        # Only triggers when VWAP is above the ATR stop; when the ATR stop is
+        # already tighter than VWAP, the regular SL check below handles the exit.
+        vwap_bar = float(vwap.iloc[j]) if j < len(vwap) and not vwap.empty else 0.0
+        if vwap_bar > 0 and bar_low < vwap_bar and vwap_bar > sl:
+            realized_pnl += (vwap_bar - entry_price) * remaining
+            remaining = 0
+            exit_bar = j
+            break
 
         # Switch to ATR trailing stop at +2R (improvement #10)
         if bar_high >= trail_level:
@@ -1796,6 +1847,14 @@ def print_results(stats: MomoStats) -> None:
     else:
         pf_str = f"{stats.profit_factor:.2f}"
     print(f"  Profit Factor:          {pf_str}")
+    # FIX #10: Profit factor warning
+    if stats.profit_factor < 1.0:
+        print("  ⚠️  WARNING: Profit Factor < 1.0 — strategy is LOSING money")
+        print("  ⚠️  Review entry criteria, stops, and time filters")
+    elif stats.profit_factor < 1.5:
+        print("  ⚠️  CAUTION: Profit Factor < 1.5 — strategy is marginal")
+    else:
+        print("  ✅  Profit Factor > 1.5 — strategy is PROFITABLE")
     print(f"  Avg Win:                +${stats.avg_win:.2f}")
     print(f"  Avg Loss:               ${stats.avg_loss:.2f}")
 
